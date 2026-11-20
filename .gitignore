@@ -1,0 +1,21 @@
+loop/runs/
+loop/.current_task
+loop/STOP
+.env
+secrets/
+__pycache__/
+
+# Phase 1 클론은 자기 저장소가 따로 있음
+kosis-ai-nlp-summary-T1-30/
+
+# 문항(질문·정답·표의 값)과 실행 결과는 올리지 않음
+evals/baseline/items.jsonl
+evals/golden_*.jsonl
+evals/golden_*.report.json
+evals/runs/
+evals/cache/
+loop/attack/
+
+# Python
+*.py[cod]
+.env.*
