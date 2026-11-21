@@ -3,6 +3,8 @@
     python evals/compare_runs.py evals/runs/s0-rules evals/runs/s1-rules
 
 Reads <run>/outputs.jsonl of both. An item is the same when every field but the time (`seconds`) is equal.
+`asked` (a hash of the question and its tables, written since 2026-11-21) is compared when both runs have it:
+a difference there means the two runs did not answer the same question under that id.
 Prints counts, the status table of each run and the ids of items that differ with the names of the fields that
 differ. It does not print the questions' answers unless --show is given (the output of a run holds them: use --show
 only where the defender cannot read).
@@ -39,7 +41,8 @@ def load(run: Path) -> dict[str, dict]:
 
 
 def differing(a: dict, b: dict) -> list[str]:
-    return sorted(k for k in a.keys() | b.keys() if k not in IGNORED and a.get(k) != b.get(k))
+    return sorted(k for k in a.keys() | b.keys() if k not in IGNORED and a.get(k) != b.get(k)
+                  and not (k == "asked" and (k not in a or k not in b)))  # a run from before the field was written
 
 
 def asked_again(before: dict, after: dict) -> bool:

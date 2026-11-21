@@ -25,6 +25,9 @@ ITEM = {  # change from 200 to 250: difference and rate of change
     "required_facts": [derived("d", 50, "b - a"), derived("r", 25.0, "(b / a - 1) * 100")],
     "aux_facts": [cell("a", "T|I|00|2020", 200), cell("b", "T|I|00|2021", 250)],
 }
+BIG = {"id": "T3", "type": "compare", "subtype": "demo", "table_keys": ["000_T"], "chart_expected": False,
+       "required_facts": [derived("s", 1e12, "a + b")],
+       "aux_facts": [cell("a", "T|I|00|2020", 4e11), cell("b", "T|I|00|2021", 6e11)]}
 CELLS = {"id": "T2", "type": "value", "subtype": "demo", "table_keys": ["000_T", "000_U"], "chart_expected": False,
          "required_facts": [cell("a", "T|I|00|2020", 200), cell("b", "U|I|00|2020", 200)], "aux_facts": []}
 
@@ -64,6 +67,15 @@ def main() -> int:
               g(ITEM, out(module_cells + [derived("f3", 50, "f2 - f1"), derived("f4", 25.0, "(f2 / f1 - 1) * 100")]))["score_same_inputs"], 1.0),
         check("right value from other cells -> same-inputs score lower",
               g(ITEM, out([cell("f9", "T|I|99|2021", 50), derived("f4", 25.0, "f9 / 2")]))["score_same_inputs"], 0.0),
+        check("the plain score takes the right value from other cells (why the loop also asks for the same-inputs score)",
+              g(ITEM, out([cell("f9", "T|I|99|2021", 50), derived("f4", 25.0, "f9 / 2")]))["score"], 1.0),
+        check("same-inputs: of two facts with the answer's value, the one from the right cells counts",
+              g(ITEM, out(module_cells + [cell("f9", "T|I|99|2021", 50), derived("f3", 50, "f2 - f1"),
+                                          derived("f4", 25.0, "(f2 / f1 - 1) * 100")]))["score_same_inputs"], 0.8),
+        check("same-inputs: another way to combine the same cells is accepted",
+              g(ITEM, out(module_cells + [derived("f3", 50, "f2 - f1"), derived("f4", 25.0, "f3 / f1 * 100")]))["score_same_inputs"], 1.0),
+        check("tables that could not be read -> 0, its own category",
+              (lambda r: (r["score"], r["category"]))(g(ITEM, {"id": "T1", "status": "load_error", "error": "boom"})), (0.0, "load_error")),
         check("one module fact cannot satisfy two answers (50 and 50.004 asked, one 50 given)",
               g({**ITEM, "required_facts": [derived("d", 50, "b - a"), derived("e", 50.0, "b - a + 0")]},
                 out([derived("f3", 50, "f2 - f1")]))["score"], 0.5),
@@ -130,6 +142,12 @@ def main() -> int:
               (lambda r: (r["extra_facts"], r["extra_counted"], r["score"]))(
                   g(ITEM, out([derived("f3", 50, "f2 - f1"), derived("f4", 25.006, "f2 / f1")]))), (1, 0, 0.5)),
         check("an empty answer list -> 0", g(ITEM, out(both, answer=[]))["score"], 0.0),
+        # the tolerance is half of the last digit at any size of the answer
+        check("a big answer: 500 off is not right", g(BIG, out([derived("f1", 1e12 + 500, "x")]))["score"], 0.0),
+        check("a big answer: 0.01 off is not right", g(BIG, out([derived("f1", 1e12 + 0.01, "x")]))["score"], 0.0),
+        check("a big answer: within half a digit", g(BIG, out([derived("f1", 1e12 + 0.004, "x")]))["score"], 1.0),
+        check("a big answer: the same number as a float computes it", g(BIG, out([derived("f1", 0.1 * 1e13, "x")]))["score"], 1.0),
+        check("half a digit, at the edge", (grade.close(25.005, 25.0, 0.005), grade.close(25.0051, 25.0, 0.005)), (True, False)),
         check("value mode: a calc cell under another ref is not extra",
               g(ITEM, out(both[2:] + [cell("f9", "Z|I|00|2020", 200)]), "value")["kept"], 1.0),
         check("legacy: nothing is extra", g(winner, {"id": "x", "status": "ok", "facts": ranked}, legacy=True)["score"], 1.0),
@@ -142,6 +160,9 @@ def main() -> int:
     results.append(check("summary categories", summary["category"], {"correct": 1, "wrong": 1, "no_plan": 1, "error": 1}))
     results.append(check("summary origins", {k: v["items"] for k, v in summary["origin"].items()}, {"model_codes": 1, "rules": 1}))
     results.append(check("summary chart accuracy", summary["chart"]["accuracy"], 1.0))
+    unread = grade.summarize(rows + [g(ITEM, {"id": "T1", "status": "load_error", "error": "boom"})])
+    results.append(check("summary: unread tables are counted apart from errors",
+                         (unread["category"].get("error"), unread["category"].get("load_error")), (1, 1)))
     cut = grade.summarize([g(ITEM, out(both + [other])), g(winner, out(ranked)), g(ITEM, out(both))])
     results.append(check("summary: items cut for extra facts", (cut["extra"]["items"], cut["extra"]["facts"],
                                                                cut["extra"]["right_but_cut"]), (2, 3, 2)))

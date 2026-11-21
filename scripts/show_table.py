@@ -6,9 +6,12 @@
                                                            # the cells that match: coordinate (source_ref), value
 
 The tables are read from <workspace>/data (--workspace, else the KOSIS_WORKSPACE environment variable). A cell's
-coordinate is tbl_id|item_id|<the code of every category the table has, in order>|period: what an attack spec
-writes under "cells". Nothing is written anywhere. A missing value (empty cell) matches no condition, not even
-dim2=None or dim2=nan, and is never part of a coordinate (a row without tbl_id, item_id or period shows "nan").
+coordinate is tbl_id|item_id|<codes>|period: what an attack spec writes under "cells", and letter for letter what
+Phase 1 calls the cell (its source_ref, kosis_chat/prepare/convert.py cells_of), since the grader compares the two
+as text. <codes> are the codes of the categories that have a name on that row, in order, joined by "|": a named
+category whose code is missing is an empty text there, and a row with no named category has one empty text
+(tbl_id|item_id||period). Nothing is written anywhere. A missing value (empty cell) matches no condition, not even
+dim2=None or dim2=nan (a row without tbl_id, item_id or period shows "nan" as its coordinate).
 
 A table is never read whole (some have 100M rows): the listing streams the needed columns a batch at a time, and
 --cell reads only the matching rows (scripts/tablescan.py).
@@ -46,13 +49,18 @@ def present(df, col: str):
 
 
 def ref_of(df):
-    """A missing tbl_id, item_id or period makes the whole coordinate NaN (printed "nan") on every pandas version."""
-    ref = present(df, "tbl_id") + "|" + present(df, "item_id")
-    for i in DIMS:
-        col = f"dim{i}_code"
-        if col in df:
-            ref = ref + df[col].map(lambda c: "" if c is None or c != c else "|" + str(c))
-    return ref + "|" + present(df, "period")
+    """Each row's coordinate, written as Phase 1 writes the cell's source_ref (see the top of this file). A missing
+    tbl_id, item_id or period makes the whole coordinate NaN (printed "nan") on every pandas version."""
+    import pandas as pd
+
+    levels = [(f"dim{i}_name", f"dim{i}_code") for i in DIMS if f"dim{i}_name" in df and f"dim{i}_code" in df]
+    gone = lambda v: v is None or v != v  # noqa: E731
+    names = [df[name].astype(object).tolist() for name, _ in levels]
+    codes = [df[code].astype(object).tolist() for _, code in levels]
+    middle = ["|".join("" if gone(code[n]) else str(code[n]) for name, code in zip(names, codes)
+                       if not gone(name[n]) and name[n] != "") for n in range(len(df))]
+    return (present(df, "tbl_id") + "|" + present(df, "item_id") + "|" + pd.Series(middle, index=df.index, dtype=str)
+            + "|" + present(df, "period"))
 
 
 def distinct_rows(table):
@@ -134,7 +142,7 @@ def show(row: dict, tf, limit: int) -> None:
 
 
 SHOWN_COLUMNS = {"tbl_id", "item_id", "item_name", "unit", "period", "value_raw", "value_kind",
-                 *(f"dim{i}_{part}" for i in DIMS for part in ("code", "label"))}
+                 *(f"dim{i}_{part}" for i in DIMS for part in ("name", "code", "label"))}
 
 
 def cells(tf, conditions: list[str], limit: int) -> None:

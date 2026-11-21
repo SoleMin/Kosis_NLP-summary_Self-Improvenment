@@ -1,9 +1,14 @@
 """The table tools read only what they need; their output must be what the old whole-table code printed and returned.
 
 The old functions are copied below as the reference. Small Parquet files with tiny row groups stand in for big tables.
-The tools treat a missing value the same on every pandas version: it matches no text and is never part of a
-coordinate (pandas 3 did that in the old code). On pandas 2 the old code made the text "None" or "nan" of it; the
-reference adapts exactly those places when PANDAS2 (marked "pandas 2:").
+The tools treat a missing value the same on every pandas version: it matches no text (pandas 3 did that in the old
+code). On pandas 2 the old code made the text "None" or "nan" of it; the reference adapts exactly those places when
+PANDAS2 (marked "pandas 2:").
+
+A coordinate is written as Phase 1 writes a cell's source_ref (2026-11-21: the old code left a missing code out and
+wrote nothing for a table without categories, so such a cell could never be graded as right). The reference below
+(old_ref_of) writes it row by row from that rule; test_refs_as_phase1 compares the tools with Phase 1's own
+function when the clone is next to this folder.
 """
 
 from __future__ import annotations
@@ -33,10 +38,11 @@ sys.path.insert(0, str(TOP / "evals"))
 import build_items  # noqa: E402
 import check_items  # noqa: E402
 import show_table  # noqa: E402
-from tablescan import TableFile  # noqa: E402
+from tablescan import TableFile, ref_column  # noqa: E402
 
 DIMS = range(1, 9)
-NAMES = ["strings", "numbers", "floats", "pipes", "many", "one_group", "empty", "eight", "nostats", "two_labels"]
+NAMES = ["strings", "numbers", "floats", "pipes", "many", "one_group", "empty", "eight", "nostats", "two_labels",
+         "nodim", "unnamed"]
 PANDAS2 = int(pd.__version__.split(".")[0]) < 3
 
 
@@ -50,12 +56,20 @@ def no_null_parts(df, ref):
 # ---- the old code (reference): reads the whole table into pandas ----
 
 def old_ref_of(df):
-    ref = df["tbl_id"].astype(str) + "|" + df["item_id"].astype(str)
-    for i in DIMS:
-        col = f"dim{i}_code"
-        if col in df:
-            ref = ref + df[col].map(lambda c: "" if c is None or c != c else "|" + str(c))
-    return no_null_parts(df, ref + "|" + df["period"].astype(str))
+    """tbl_id|item_id|<codes>|period as Phase 1's cells_of writes it: the codes of the categories named on the row,
+    "" for a named one without a code, joined by "|" (so one "" when no category is named)."""
+    def codes(r) -> str:
+        out = []
+        for i in DIMS:
+            name, code = r.get(f"dim{i}_name"), r.get(f"dim{i}_code")
+            if name is None or name != name or name == "":
+                continue
+            out.append("" if code is None or code != code else str(code))
+        return "|".join(out)
+
+    middle = pd.Series([codes(r) for r in df.to_dict("records")], index=df.index, dtype=str)
+    ref = df["tbl_id"].astype(str) + "|" + df["item_id"].astype(str) + "|" + middle + "|" + df["period"].astype(str)
+    return no_null_parts(df, ref)
 
 
 def old_show(row: dict, df, limit: int) -> None:
@@ -107,12 +121,7 @@ def old_cells(df, conditions: list[str], limit: int) -> None:
 
 def old_load_table(path: Path):
     df = pq.read_table(path).to_pandas()
-    ref = df["tbl_id"].astype(str) + "|" + df["item_id"].astype(str)
-    for i in range(1, 9):
-        col = f"dim{i}_code"
-        if col in df:
-            ref = ref + df[col].map(lambda c: "" if c is None or c != c else "|" + str(c))
-    ref = no_null_parts(df, ref + "|" + df["period"].astype(str))
+    ref = old_ref_of(df)
     rows = defaultdict(list)
     for r, v, raw, kind in zip(ref, df["value"], df["value_raw"], df["value_kind"]):
         rows[r].append((v, raw, kind))
@@ -224,6 +233,24 @@ def variants(tmp: Path):
             for c, label in pairs]
     write(tmp / "two_labels.parquet", rows, {"value": pa.float64()}, 3)
     out["two_labels"] = tmp / "two_labels.parquet"
+
+    # a table without any category: Phase 1 writes tbl_id|item_id||period
+    rows = [{"tbl_id": "DT_NODIM", "prd_se": "Y", "period": p, "item_id": it, "item_name": "인구", "unit": "명",
+             "value": float(n), "value_raw": str(n), "value_kind": "ok"}
+            for n, (p, it) in enumerate((p, it) for p in ["2021", "2022", "2023"] for it in ["T1", "T2"])]
+    write(tmp / "nodim.parquet", rows, {"value": pa.float64()}, 4)
+    out["nodim"] = tmp / "nodim.parquet"
+
+    # a code under a category without a name is not part of the coordinate; a named category without a code is ""
+    rows = [{"tbl_id": "DT_UNNAMED", "prd_se": "Y", "period": p, "item_id": "T1", "item_name": "인구", "unit": "명",
+             "value": float(n), "value_raw": str(n), "value_kind": "ok", "dim1_name": "시도별", "dim1_code": c1,
+             "dim1_label": "곳", "dim2_name": name2, "dim2_code": c2, "dim2_label": "성", "dim3_name": "연령별",
+             "dim3_code": c3, "dim3_label": None if c3 is None else "나이"}
+            for n, (p, c1, (name2, c2), c3) in enumerate(
+                (p, c1, d2, c3) for p in ["2022", "2023"] for c1 in ["00", "11"]
+                for d2 in [("성별", "1"), (None, "2"), ("", "3"), (None, None)] for c3 in ["A", None])]
+    write(tmp / "unnamed.parquet", rows, {"value": pa.float64()}, 5)
+    out["unnamed"] = tmp / "unnamed.parquet"
     return out
 
 
@@ -293,10 +320,50 @@ def test_load_table(tables, name):
             assert same(new.get(ref, []), old.get(ref, [])), ref
     if keys:  # duplicated coordinates come back as two rows
         dup = [k for k in keys if len(old[k]) > 1]
-        assert name in ("empty", "many", "eight") or dup
+        assert name in ("empty", "many", "eight", "nodim", "unnamed") or dup
         assert all(same(check_items.load_table(tables[name], [k])[k], old[k]) for k in dup)
     every = check_items.load_table(tables[name])  # old signature: every row with a coordinate
     assert set(every) == set(keys) and all(same(every[k], old[k]) for k in keys)
+
+
+def test_refs_written_as_phase1(tables):
+    """The cases the old code wrote otherwise: no category, a named category without a code, a code without a name."""
+    refs = set(check_items.load_table(tables["nodim"]))
+    assert "DT_NODIM|T1||2023" in refs and len(refs) == 6 and all(r.count("|") == 3 for r in refs)
+    assert check_items.load_table(tables["nodim"], ["DT_NODIM|T1||2023", "DT_NODIM|T1|2023"]).keys() == {"DT_NODIM|T1||2023"}
+    refs = set(check_items.load_table(tables["unnamed"]))
+    assert {"DT_UNNAMED|T1|00|1|A|2022", "DT_UNNAMED|T1|00|1||2022", "DT_UNNAMED|T1|00|A|2022", "DT_UNNAMED|T1|00||2022"} <= refs
+    got = check_items.load_table(tables["unnamed"], ["DT_UNNAMED|T1|00|A|2022", "DT_UNNAMED|T1|00|2|A|2022"])
+    assert len(got["DT_UNNAMED|T1|00|A|2022"]) == 3 and "DT_UNNAMED|T1|00|2|A|2022" not in got  # (three rows name no dim2)
+    out = printed(show_table.cells, TableFile(tables["nodim"]), ["item=T1", "period=2023"], 5)
+    assert "DT_NODIM|T1||2023 " in out, out
+
+
+PHASE1 = TOP / "kosis-ai-nlp-summary-T1-30"
+TEXT_TABLES = ["strings", "pipes", "many", "one_group", "eight", "nostats", "two_labels", "nodim", "unnamed"]
+
+
+@pytest.mark.skipif(not (PHASE1 / "kosis_chat" / "prepare" / "convert.py").is_file(), reason="the Phase 1 clone is not here")
+@pytest.mark.parametrize("name", TEXT_TABLES)
+def test_refs_as_phase1(tables, name):
+    """The tools' coordinate is the source_ref Phase 1's own cells_of gives the same row (text columns, as the
+    provided tables are). Run in another process: Phase 1 is not imported into this one."""
+    code = ("import sys, json, types; sys.path[:0] = [sys.argv[1], sys.argv[1] + '/src']\n"
+            "import pyarrow.parquet as pq\n"
+            "from kosis_chat.prepare.convert import cells_of, rows_of\n"
+            "rows = rows_of(pq.read_table(sys.argv[2]))\n"
+            "meta = types.SimpleNamespace(tbl_id=rows[0]['tbl_id'])\n"
+            "print(json.dumps([c.source_ref for c in cells_of(rows, meta)]))\n")
+    done = subprocess.run([sys.executable, "-c", code, PHASE1.as_posix(), str(tables[name])], capture_output=True,
+                          text=True, encoding="utf-8", env=os.environ | {"PYTHONUTF8": "1"})
+    assert done.returncode == 0, done.stderr[-2000:]
+    theirs = json.loads(done.stdout)
+    tf = TableFile(tables[name])
+    mine = []
+    for group in tf.row_groups():
+        keys = tf.read(group, ["tbl_id", "item_id", "period", *(f"dim{i}_{p}" for i in DIMS for p in ("name", "code"))])
+        mine += ref_column(tf, keys).to_pylist()
+    assert mine == theirs
 
 
 def test_small_batches(tables, monkeypatch):
@@ -306,6 +373,34 @@ def test_small_batches(tables, monkeypatch):
     monkeypatch.setattr(tablescan, "BATCH", 5)
     test_cells(tables, "strings", 7)
     test_cells(tables, "one_group", 40)
+
+
+def test_build_rejects_values_that_tell_no_calculation_apart(tables, tmp_path):
+    """A spec whose answer stays the same under another calculation of the same cells is not an item: with 2 and 2
+    a product passes for a sum (the grader compares numbers and cells, not how they were combined)."""
+    values = tmp_path / "data" / "values"
+    values.mkdir(parents=True)
+    (values / "000_DT_NODIM.parquet").write_bytes(tables["nodim"].read_bytes())
+    cell = lambda period, item: f"DT_NODIM|{item}||{period}"  # noqa: E731  values: 2021 T1=0 T2=1, 2022 2 3, 2023 4 5
+    spec = lambda i, cells, formula: {"id": i, "question": f"q {i}", "table_keys": ["000_DT_NODIM"], "type": "compare",  # noqa: E731
+                                      "cells": cells, "answers": [{"id": "r", "formula": formula, "round": 2}]}
+    specs = [spec("sum", {"a": cell("2022", "T1"), "b": cell("2022", "T2")}, "a + b"),            # 2 + 3: only a sum is 5
+             spec("zero", {"a": cell("2022", "T1"), "b": cell("2021", "T1")}, "a - b"),           # 2 - 0 = 2 + 0
+             spec("one", {"a": cell("2023", "T2"), "b": cell("2021", "T2")}, "a * b"),            # 5 * 1 = 5 / 1
+             spec("rate", {"a": cell("2022", "T1"), "b": cell("2023", "T2")}, "(b / a - 1) * 100"),          # 2 -> 5
+             spec("rate24", {"a": cell("2022", "T1"), "b": cell("2023", "T1")}, "(b / a - 1) * 100"),      # 4 / 2 = 4 - 2
+             {**spec("step", {"a": cell("2022", "T1"), "b": cell("2021", "T1"), "c": cell("2023", "T2")}, "d * c"),
+              "steps": [{"id": "d", "formula": "a + b", "round": 2}]}]                             # the step: 2 + 0 = 2 - 0
+    path = tmp_path / "spec.jsonl"
+    path.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in specs) + "\n", encoding="utf-8")
+    out = tmp_path / "items.jsonl"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert build_items.main(["--spec", str(path), "--out", str(out), "--workspace", str(tmp_path), "--known"]) == 0
+    report = json.loads(out.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert report["sum"] == "built" and report["rate"] == "built", report
+    assert all("the result is the same when" in report[i] for i in ("zero", "one", "step", "rate24")), report
+    assert build_items.same_under_another("a + b", {"a": build_items.Decimal(2), "b": build_items.Decimal(2)},
+                                          build_items.Decimal(4), build_items.Decimal("0.01")) == "'+' is '*'"
 
 
 def test_build_and_check(tables, tmp_path, monkeypatch):

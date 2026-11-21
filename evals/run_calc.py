@@ -26,6 +26,17 @@ object (LLMConfig); Phase 1 reads no .env. The key is looked up in this order: t
 own evals read). Only that one variable is read from the file. --no-env-file (or KOSIS_DOTENV=off) reads no file.
 The key is never printed or saved.
 
+An item whose tables could not be read (the file is missing or damaged, the memory ran out) ends as "load_error",
+apart from "error" (the calculation raised on the question). A load error says nothing about the code under test:
+grade.py reports it on its own and a score with such items in it is not a measurement. Items that ended that way
+are run again whenever the same --out is given again; --retry-errors also runs the "error" items again.
+
+The same --out continues a run only where it is the same run: an output is kept when it was written for the same
+question over the same tables (each output line carries a hash of them, "asked") and the folder's meta.json names
+the same conditions (backend, model, thinking, fill prompt, the clone and its commit, --big-rows, the workspace).
+An item whose question changed under the same id is run again, and under other conditions every item is.
+(Uncommitted changes in the clone are not among the conditions: after changing code, use a new --out.)
+
 Output: <out>/outputs.jsonl (one line per item: status, origin, the facts and which of them are the answer) and
 <out>/meta.json. These files contain the questions' answers: keep the folder where the defender cannot read it.
 """
@@ -49,6 +60,33 @@ DEFAULT_CACHE = HERE / "cache" / "fill.jsonl"
 TABLES_KEPT = 48  # prepared tables kept in memory (items are run table by table)
 CELLS_KEPT = 1_000_000  # ... and at most this many cells in them (about 1.4 GB); the table in use is always kept
 FILE_TABLE_CELLS = 250_000  # what a table read from its file counts as (it holds its index, not its cells)
+
+
+CONDITIONS = ("backend", "model", "thinking", "fill_prompt", "phase1", "phase1_head", "big_rows", "workspace")
+
+
+def asked_hash(item: dict) -> str:
+    """What an output answers: the question and the tables it was asked over."""
+    text = json.dumps([item["question"], list(item["table_keys"])], ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+class TableUnread(Exception):
+    """A table of the item could not be loaded (cause: what was raised)."""
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def reading_failed(exc: BaseException, model_in_use: bool) -> bool:
+    """Whether what the calculation raised is a table that could not be read, not the calculation going wrong on
+    the question. A big table's cells are read from its file while it calculates: a file that is gone or locked, a
+    disk error, memory running out. With a model in use an OSError can also be a failed call (a dropped
+    connection), so there only the errors that cannot be one are taken."""
+    if isinstance(exc, (MemoryError, FileNotFoundError, PermissionError)):
+        return True
+    return isinstance(exc, OSError) and not model_in_use
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -238,7 +276,8 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out or HERE / "runs" / f"{datetime.now():%Y%m%d-%H%M%S}-calc-{args.backend}{part_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs = out_dir / "outputs.jsonl"
-    done = {o["id"] for o in load_jsonl(outputs) if o.get("status") != "error" or not args.retry_errors}
+    last = {o["id"]: o for o in load_jsonl(outputs)}  # a later line of an id replaces an earlier one
+    asked = {i["id"]: asked_hash(i) for i in items}
     meta = {"path": "calc", "items": str(args.items.resolve()),
             "items_sha256": hashlib.sha256(args.items.read_bytes()).hexdigest(), "backend": args.backend, "split": args.split,
             "model": model if args.backend == "hcx" else None,
@@ -248,6 +287,22 @@ def main(argv: list[str] | None = None) -> int:
             "big_rows": getattr(parquet, "BIG_TABLE_ROWS", None),
             "cache": None if (args.no_cache or args.backend != "hcx") else str(args.cache),
             "started": datetime.now().isoformat(timespec="seconds")}
+    try:  # the conditions the outputs already in the folder were made under
+        before = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        before = None
+    differs = [] if not last else ["meta.json"] if not isinstance(before, dict) else \
+        [k for k in CONDITIONS if before.get(k) != meta[k]]
+    if differs:
+        print(f"the outputs in {out_dir} were made under other conditions ({', '.join(differs)}): every item is run again",
+              file=sys.stderr)
+    done = {i for i, o in last.items()
+            if not differs and o.get("asked") == asked.get(i) and o.get("status") != "load_error"
+            and (o.get("status") != "error" or not args.retry_errors)}
+    stale = sum(1 for i, o in last.items() if i in asked and o.get("asked") != asked[i])
+    if stale and not differs:
+        print(f"{stale} outputs in {out_dir} answer another question or tables than the item now has (or do not say): "
+              f"run again", file=sys.stderr)
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     tables: OrderedDict[str, object] = OrderedDict()
@@ -264,18 +319,29 @@ def main(argv: list[str] | None = None) -> int:
 
     todo = [i for i in items if i["id"] not in done]
     print(f"{len(todo)} to run ({len(items) - len(todo)} already done) -> {out_dir}", file=sys.stderr)
-    errors = 0
+    errors = unread = 0
     with outputs.open("a", encoding="utf-8") as f:
         for n, item in enumerate(todo, start=1):
             started = time.perf_counter()
             asked_before = client.asked if client is not None else 0
             try:
-                result = calc.calculate(item["question"], [prepared(k) for k in item["table_keys"]], llm=config,
-                                        client=client, retry_interval=args.interval)
+                try:
+                    loaded = [prepared(k) for k in item["table_keys"]]
+                except Exception as exc:  # the tables are not there to calculate on: not the calculation's failure
+                    raise TableUnread(exc) from None
+                result = calc.calculate(item["question"], loaded, llm=config, client=client,
+                                        retry_interval=args.interval)
                 record = {"id": item["id"], **result.record()}
-            except Exception as exc:  # a failed model call or a crash is a failed item, not a stopped run
-                errors += 1
-                record = {"id": item["id"], "status": "error", "error": f"{type(exc).__name__}: {exc}"[:500]}
+            except Exception as exc:
+                cause = exc.cause if isinstance(exc, TableUnread) else exc
+                if isinstance(exc, TableUnread) or reading_failed(exc, client is not None):
+                    unread += 1
+                    status = "load_error"
+                else:  # a failed model call or a crash is a failed item, not a stopped run
+                    errors += 1
+                    status = "error"
+                record = {"id": item["id"], "status": status, "error": f"{type(cause).__name__}: {cause}"[:500]}
+            record["asked"] = asked[item["id"]]
             record["seconds"] = round(time.perf_counter() - started, 2)
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             f.flush()
@@ -285,7 +351,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.sleep)
     if client is not None:
         print(f"model: {client.asked} asked, {client.hits} from the cache", file=sys.stderr)
-    print(f"done: {len(todo)} run, {errors} errors -> {out_dir}", file=sys.stderr)
+    print(f"done: {len(todo)} run, {errors} errors, {unread} with tables that could not be read -> {out_dir}",
+          file=sys.stderr)
     print(str(out_dir))
     return 0
 

@@ -6,12 +6,14 @@
     bash scripts/verify.sh            the defender's pass/fail gate (this file with --verify)
 
 One loop (N is the loop number; AGENTS.md 4장):
-   0  script    the baseline's dev part is scored (reused when the clone has not changed since it was scored)
+   0  script    the baseline's dev part is scored (reused when neither the clone nor the judge, the scripts and
+                items in evals/, has changed since it was scored)
    1  critic    writes the attack hint                      -> loop/attack/hint_N.md
    2  attacker  writes specs: question, cells, formulas     -> loop/attack/spec_N.jsonl
                 and, when it found fewer than asked, what it searched -> loop/attack/spec_N.search.md
-                fewer than ATTACK_MIN specs from an attacker that ended normally and wrote that report: the final
-                verify runs and the goal is complete (kept=done)
+                fewer than ATTACK_MIN specs from an attacker that ended normally and wrote that report: the critic
+                reviews the report (-> loop/attack/search_N.json). Accepted: the final verify runs and the goal is
+                complete (kept=done). Not accepted: stop. The search tools did not work: fault.
    3  critic    first judgment of the specs                 -> loop/attack/judge1_N.jsonl
                 a spec without a verdict is asked for again. BAD_RATIO or more rejected: one rewrite, then stop.
    4  script    fills the numbers and checks them           -> evals/golden_N.jsonl (evals/build_items.py)
@@ -24,20 +26,24 @@ One loop (N is the loop number; AGENTS.md 4장):
                 out of the project (the vault) and put back afterwards.
    9  script    files changed outside loop/defender_allow.txt, the shared schema changed beyond adding to the
                 calculation plan (scripts/contract_check.py), traces of reaching for the hidden data, verify,
-                scores after the fix, the keep rule:
-                dev not lower, this attack higher, earlier attacks not lower
+                the defender's new tests run on the code before the fix and on the code after it (a test must fail
+                before and pass after), scores after the fix, the keep rule: dev and the earlier attacks not lower
+                by the plain score nor by the same-inputs score; this attack higher by the same-inputs score and
+                not lower by the plain score
   10  critic    judges the change (the diff) and writes the record -> loop/critic/code_N.json
                 the record is written as drafts (loop/attack/records_N/), checked for item content by the script and
                 only then copied to loop/log.md, loop/learnings.md and docs/current-state.md. A loop without a change
-                (all attack items already right, or the defender changed nothing) gets a record too.
+                (all attack items already right by both scores, or the defender changed nothing) gets a record too.
   11  script    commit in the clone, or reset; one line in loop/results.tsv; the records committed in this repository
 
 How a run ends is told apart (the kept column of loop/results.tsv, or loop/faults.tsv):
-  done     the attacker searched and found fewer than ATTACK_MIN weaknesses, and the final verify passed (GOAL.md)
-  stop     a rule of the loop ended it: the judgments left too few attack items
+  done     the attacker searched and found fewer than ATTACK_MIN weaknesses, the critic accepted its search report
+           and the final verify passed (GOAL.md)
+  stop     a rule of the loop ended it: the judgments left too few attack items, or the search was not accepted
   blocked  an agent wrote loop/blocked.md; a defender's change of that loop is saved as a diff, never committed
   fault    the loop could not be carried out (an agent failed or timed out without its output, an output file is
-           malformed, a measurement failed, a protected file changed). No row in loop/results.tsv: one line in
+           malformed, a measurement failed or could not read its tables, the attacker's search tools did not work,
+           a protected file changed). No row in loop/results.tsv: one line in
            loop/faults.tsv, and the next run starts the same loop number again.
 
 Git commands that change anything run inside the clone only (git -C <clone>), on its loop branch. This repository
@@ -61,6 +67,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ElementTree
 import time
 import traceback
 from datetime import datetime
@@ -70,7 +77,10 @@ import contract_check
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_HEADER = ["loop", "time", "items", "dev_before", "dev_after", "attack_before", "attack_after", "past_before",
-                  "past_after", "verify", "kept", "reason", "commit"]
+                  "past_after", "verify", "kept", "reason", "commit",
+                  # the same-inputs score (evals/grade.py: the cells of a calculation must be the item's too)
+                  "dev_strict_before", "dev_strict_after", "attack_strict_before", "attack_strict_after",
+                  "past_strict_before", "past_strict_after"]
 HIDDEN = ("evals", "loop/attack", "loop/runs")  # moved out of the project while the defender runs
 # what an agent's tool call must not name while it is the defender (the data is gone then; this finds the attempt)
 REACH = re.compile(r"(?i)(^|[\s\"'=:(\\/])evals([\\/\s\"')]|$)|golden_[\d*{\[]|items\.jsonl|loop[\\/]+(attack|runs)|"
@@ -95,7 +105,12 @@ RETRY_QUICK = 600  # seconds: a second or later try that worked longer than this
 RECORDS = {"log.md": "loop/log.md", "learnings.md": "loop/learnings.md", "current-state.md": "docs/current-state.md"}
 RECORDS_CHECKED = "loop/runs/records_checked.json"  # hashes of the record files as last checked for item content
 REASK = 2  # times the critic is asked again for the verdicts it left out
+PYARROW_MIN = 15  # what Phase 1 asks for (its pyproject.toml); scripts/show_table.py fails on some tables under 11
 TESTS_BEFORE_TIMEOUT = 900  # seconds for the defender's new tests on the code before the fix
+# With the rules alone an item in error is a graded item. A dev measurement with this share of its items in error
+# is not a weak code under test but a run that does not work (a missing package, a broken clone): not a measurement.
+DEV_ERROR_SHARE = 0.5
+SEARCH_TOOLS = ("try_question.py", "show_table.py")  # what the attacker searches with (docs/ATTACKER.md)
 
 
 class Stop(Exception):
@@ -117,7 +132,7 @@ class Handoff(Stop):
 class Fault(Stop):
     """The loop could not be carried out: not a result of the loop. No row in loop/results.tsv (one line in
     loop/faults.tsv); the next run starts the same loop number again. kind: agent | timeout | no_output | format |
-    measure | script | tamper | leak | setup | crash."""
+    measure | script | tools | tamper | leak | setup | crash."""
 
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
@@ -129,6 +144,11 @@ class AgentFailed(Fault):
 
     def __init__(self, message: str) -> None:
         super().__init__("agent", message)
+
+
+class NotSaved(Exception):
+    """The clone's change could not be saved as a diff. The clone is left as it is: a change is never thrown away
+    unsaved."""
 
 
 class Short(Exception):
@@ -234,6 +254,23 @@ def read_verdicts(path: Path) -> tuple[dict[str, tuple[bool, str]], int]:
         else:
             bad += 1
     return verdicts, bad
+
+
+def read_review(file: Path, verdicts: tuple[str, ...], needs: dict[str, tuple[str, ...]]) -> tuple[dict | None, list[str]]:
+    """A review the critic wrote as one JSON object: (the object when its "verdict" is one of `verdicts`, the fields
+    that verdict must come with and that are empty). "reason" is always needed; needs: more fields by verdict.
+    A verdict without what it rests on is not taken: it is asked for again."""
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, ["verdict"]
+    if not isinstance(data, dict) or data.get("verdict") not in verdicts:
+        return None, ["verdict"]
+
+    def empty(value) -> bool:
+        return not (isinstance(value, str) and value.strip()) and not (isinstance(value, (list, dict)) and value)
+
+    return data, [key for key in ("reason", *needs.get(data["verdict"], ())) if empty(data.get(key))]
 
 
 def blocked_text() -> str:
@@ -441,7 +478,7 @@ def leaks(text: str, items: list[dict], window: int = 12) -> list[str]:
 def aggregate_md(title: str, summary: dict, subtypes: bool) -> str:
     """The numbers of a graded run the defender may see: counts and means, nothing of an item."""
     names = {"correct": "정답", "wrong": "숫자 틀림", "not_accepted": "모델이 계획·숫자를 정함", "refused": "계산 거절",
-             "no_plan": "계획 실패", "error": "오류"}
+             "no_plan": "계획 실패", "error": "오류", "load_error": "표 읽기 실패"}
     origin = {"rules": "규칙만", "model_codes": "모델이 분류만 채움", "model_type": "모델이 유형까지 정함"}
     lines = [f"### {title}", "", f"- 문항 {summary['items']}건, 점수 {summary['score']:.4f}",
              "- 결과: " + ", ".join(f"{names.get(k, k)} {v}" for k, v in summary.get("category", {}).items())]
@@ -451,6 +488,8 @@ def aggregate_md(title: str, summary: dict, subtypes: bool) -> str:
         lines.append("- 계획 실패·계산 거절 이유: " + ", ".join(f"{k} {v}" for k, v in summary["reason"].items()))
     extra = summary.get("extra") or {}
     lines.append(f"- 답과 관계없는 값으로 감점된 문항: {extra.get('items', 0)}건")
+    if summary.get("score_same_inputs") is not None:
+        lines.append(f"- 칸 일치 점수(계산 값은 계산에 쓴 칸까지 정답과 같아야 인정): {summary['score_same_inputs']:.4f}")
     lines += ["", "| 유형 | 문항 | 점수 |", "|---|---|---|"]
     for key in ("type", "tables") + (("subtype",) if subtypes else ()):
         label = {"type": "", "tables": "표 개수 ", "subtype": "세부 "}[key]
@@ -536,6 +575,8 @@ class Loop:
         self.final_items = False  # evals/golden_N.jsonl holds the items both judgments passed (ATTACK_MIN or more)
         self.after_stop = ""  # a reason to stop once this loop is recorded
         self.last_exit = 0  # the exit code of the last agent run (TIMED_OUT: stopped at AGENT_TIMEOUT)
+        self.attacker_log: Path | None = None  # the log of the attacker's last run
+        self.left_in_clone = False  # the clone's change could not be saved as a diff and was left where it is
 
     # ---- plumbing
 
@@ -669,25 +710,70 @@ class Loop:
 
     def shelve(self, name: str) -> str:
         """Save the clone's uncommitted change as loop/runs/loop-N/<name> (a diff a person can read and apply) and
-        reset the clone. Returns where it is, '' when the clone had no change."""
+        reset the clone. Returns where it is, '' when the clone had no change. The clone is reset only once the diff
+        is known to hold the whole change: git could stage it, wrote a diff, and that diff taken back out of the
+        staged state gives exactly HEAD (holds_change). Otherwise NotSaved, with the change still in the clone."""
         if not self.clone_changes():
             return ""
-        self.git("add", "-A")
+        staged = self.git("add", "-A")
+        if staged.returncode != 0:
+            raise NotSaved(f"git add 실패 (exit {staged.returncode}): {staged.stderr.strip()[:200]}")
+        made = self.git_bytes("diff", "--cached", "--binary")
+        if made.returncode != 0 or not made.stdout.strip():
+            raise NotSaved(f"git diff 실패 (exit {made.returncode}, {len(made.stdout)}바이트)")
         file = fresh(self.dir / name)
-        file.parent.mkdir(parents=True, exist_ok=True)
-        # bytes as git wrote them, so that `git apply` takes the file whatever the line endings are
-        file.write_bytes(subprocess.run(["git", "-C", str(self.s.clone), "diff", "--cached", "--binary"],
-                                        capture_output=True).stdout)
+        try:
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(made.stdout)  # bytes as git wrote them: `git apply` takes the file whatever the line endings
+            written = file.read_bytes() == made.stdout
+        except OSError as exc:
+            raise NotSaved(f"diff 파일을 쓰지 못함 ({type(exc).__name__})") from None
+        if not written or not self.holds_change(file):
+            file.unlink(missing_ok=True)  # not a diff anyone should apply
+            raise NotSaved("저장한 diff가 클론의 수정 전체와 맞지 않음")
         self.revert()
+        left = self.clone_changes()
+        if left:
+            raise NotSaved(f"diff는 {file.relative_to(ROOT).as_posix()}에 저장했으나 클론을 되돌리지 못함 ({len(left)}개 파일)")
         return file.relative_to(ROOT).as_posix()
+
+    def holds_change(self, diff: Path) -> bool:
+        """Whether the diff file is the whole staged change: the staged tree with the diff taken out again is HEAD's
+        tree. Done on a copy of the index, so neither the clone's index nor its files are touched. (That the diff
+        applies is not enough: a diff cut off between two files applies, and has lost the rest.)"""
+        staged, head = self.git("write-tree"), self.git("rev-parse", "HEAD^{tree}")
+        if staged.returncode != 0 or head.returncode != 0:
+            return False
+        with tempfile.TemporaryDirectory(prefix="kosis_loop_index_", ignore_cleanup_errors=True) as tmp:
+            env = os.environ | {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            git = ["git", "-C", str(self.s.clone)]
+            if run([*git, "read-tree", staged.stdout.strip()], env=env).returncode != 0:
+                return False
+            if run([*git, "apply", "--cached", "--reverse", str(diff)], env=env).returncode != 0:
+                return False
+            back = run([*git, "write-tree"], env=env)
+        return back.returncode == 0 and back.stdout.strip() == head.stdout.strip()
+
+    def git_bytes(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(self.s.clone), *args], capture_output=True)
+
+    def put_away(self, name: str) -> str:
+        """shelve() for the end of a loop: a sentence about where the clone's change went ('' when it had none)."""
+        if self.left_in_clone:  # said once already; it is still there
+            return ""
+        try:
+            saved = self.shelve(name)
+        except NotSaved as exc:
+            self.left_in_clone = True
+            return f". 클론의 수정을 diff로 남기지 못해 되돌리지 않고 클론에 그대로 둠 ({exc}). 사람이 확인할 것"
+        return f". 클론의 수정은 커밋하지 않고 {saved}에 남김" if saved else ""
 
     def handoff(self, when: str) -> None:
         """loop/blocked.md has text: an agent handed the loop to a person (AGENTS.md 6장). The loop ends here and
         nothing of it is committed; a change in the clone is saved as a diff next to the reason."""
         if not blocked_text():
             return
-        saved = self.shelve("blocked.diff")
-        raise Handoff(f"{when} loop/blocked.md에 내용이 있음" + (f". 클론의 수정은 커밋하지 않고 {saved}에 남김" if saved else ""))
+        raise Handoff(f"{when} loop/blocked.md에 내용이 있음" + self.put_away("blocked.diff"))
 
     def guarded(self, role: str, step: str, prompt: str, may_write: tuple[str, ...], staged: bool = False,
                 output: Path | None = None) -> Path:
@@ -740,26 +826,30 @@ class Loop:
         out = fresh(ROOT / "evals" / "runs" / f"loop-{self.n}" / tag)
         cmd = [self.s.python, "evals/run_eval.py", "--items", str(items), "--out", str(out), "--backend", self.s.backend,
                "--phase1", str(self.s.clone), "--quiet", *(["--split", split] if split else []), *self.s.eval_args]
-        errors, summary, last = 0, None, ""
+        errors, unread, summary, last = 0, 0, None, ""
         for attempt in (1, 2):
             done = run(cmd + (["--retry-errors"] if attempt == 2 else []), log=self.log)
             last = (done.stdout.strip().splitlines() or [""])[-1]
             file = out / "summary.json"
             summary = json.loads(file.read_text(encoding="utf-8")) if done.returncode == 0 and file.exists() else None
-            errors = (summary or {}).get("category", {}).get("error", 0) if summary else -1
-            if errors == 0 or (summary is not None and self.errors_count):
+            category = (summary or {}).get("category", {})
+            errors, unread = (category.get("error", 0), category.get("load_error", 0)) if summary else (-1, 0)
+            if summary is not None and not unread and (errors == 0 or self.errors_count):
                 break  # with the rules alone an item's error is the code raising: the same again on a second run
         if summary is None:
-            return {"score": None, "errors": -1, "items": 0, "summary": None, "run": str(out), "last": last}
-        return {"score": float(summary["final"]), "errors": errors, "items": summary["items"], "summary": summary,
-                "run": str(out)}
+            return {"score": None, "strict": None, "errors": -1, "unread": 0, "items": 0, "summary": None,
+                    "run": str(out), "last": last}
+        strict = summary.get("score_same_inputs")
+        return {"score": float(summary["final"]), "strict": None if strict is None else float(strict), "errors": errors,
+                "unread": unread, "items": summary["items"], "summary": summary, "run": str(out)}
 
     def measure_dev(self, tag: str) -> dict:
         """The baseline's dev part. A score of the same clone commit under the same settings is reused."""
         head = self.git("rev-parse", "HEAD").stdout.strip()
         clean = not self.clone_changes()
         cache = self.dev_cache()
-        if clean and (hit := cache.get(self.dev_key(head))) and Path(hit["run"], "summary.json").exists():
+        if clean and (hit := cache.get(self.dev_key(head))) and hit.get("strict") is not None \
+                and Path(hit["run"], "summary.json").exists():
             summary = json.loads(Path(hit["run"], "summary.json").read_text(encoding="utf-8"))
             return hit | {"summary": summary, "reused": True}
         got = self.measure(tag, ROOT / "evals" / "baseline" / "items.jsonl", "dev")
@@ -768,7 +858,15 @@ class Loop:
         return got
 
     def dev_key(self, head: str) -> str:
-        return hashlib.sha256(json.dumps([head, self.s.backend, self.s.eval_args]).encode()).hexdigest()[:16]
+        """What a dev score depends on: the clone's commit, the settings of the measurement, and the judge itself
+        (the scripts in evals/, the baseline items, the split). A score taken under another judge is not reused, so
+        the scores before and after a fix are always taken under the same one."""
+        judge = hashlib.sha256()
+        files = sorted((ROOT / "evals").glob("*.py")) + [ROOT / "evals" / "baseline" / "items.jsonl",
+                                                         ROOT / "evals" / "baseline" / "split.json"]
+        for file in files:
+            judge.update(file.name.encode("utf-8") + b"\0" + (file.read_bytes() if file.is_file() else b"") + b"\0")
+        return hashlib.sha256(json.dumps([head, self.s.backend, self.s.eval_args, judge.hexdigest()]).encode()).hexdigest()[:16]
 
     @staticmethod
     def dev_cache() -> dict:
@@ -780,7 +878,7 @@ class Loop:
         if self.broken(got):
             return
         cache = self.dev_cache()
-        cache[self.dev_key(self.git("rev-parse", "HEAD").stdout.strip())] = {k: got[k] for k in ("score", "errors", "items", "run")}
+        cache[self.dev_key(self.git("rev-parse", "HEAD").stdout.strip())] = {k: got[k] for k in ("score", "strict", "errors", "unread", "items", "run")}
         (ROOT / "evals" / "runs" / "dev_scores.json").write_text(json.dumps(cache, indent=1), encoding="utf-8")
 
     def measure_past(self, tag: str) -> dict | None:
@@ -788,11 +886,12 @@ class Loop:
         parts = [self.measure(f"{tag}-{f.stem}", f) for f in attack_sets(self.n) if load_jsonl(f)]
         if not parts:
             return None
-        if any(p["score"] is None for p in parts):
-            return {"score": None, "errors": -1, "items": 0}
+        if any(p["score"] is None or p["strict"] is None for p in parts):
+            return {"score": None, "strict": None, "errors": -1, "unread": 0, "items": 0}
         total = sum(p["items"] for p in parts)
-        return {"score": sum(p["score"] * p["items"] for p in parts) / total, "errors": sum(p["errors"] for p in parts),
-                "items": total}
+        return {"score": sum(p["score"] * p["items"] for p in parts) / total,
+                "strict": sum(p["strict"] * p["items"] for p in parts) / total,
+                "errors": sum(p["errors"] for p in parts), "unread": sum(p["unread"] for p in parts), "items": total}
 
     @property
     def errors_count(self) -> bool:
@@ -803,8 +902,24 @@ class Loop:
         return self.s.backend == "rules"
 
     def broken(self, *parts: dict | None) -> bool:
-        """A measurement that cannot be used: no score at all, or (not with the rules alone) items in error."""
-        return any(p is not None and (p["score"] is None or (p["errors"] != 0 and not self.errors_count)) for p in parts)
+        """A measurement that cannot be used: no score at all, items whose tables could not be read (evals/run_calc.py
+        tells them apart from the code raising), or (not with the rules alone) items in error."""
+        return any(p is not None and (p["score"] is None or p["strict"] is None or p["unread"]
+                                      or (p["errors"] != 0 and not self.errors_count)) for p in parts)
+
+    def trouble(self, **parts: dict | None) -> str:
+        """What is wrong with measurements that are broken(), by name, for a message."""
+        found = []
+        for name, p in parts.items():
+            if p is None:
+                continue
+            if p["score"] is None or p["strict"] is None:
+                found.append(f"{name}: 채점 결과가 없음")
+            elif p["unread"]:
+                found.append(f"{name}: 표를 읽지 못한 문항 {p['unread']}건 (코드의 결과가 아님)")
+            elif p["errors"] != 0 and not self.errors_count:
+                found.append(f"{name}: 오류로 끝난 문항 {p['errors']}건")
+        return ", ".join(found)
 
     # ---- the steps
 
@@ -838,7 +953,8 @@ class Loop:
                      self.attack / f"spec_{self.n}.try1.jsonl", self.attack / f"judge1_{self.n}.try1.jsonl",
                      self.attack / f"judge1_{self.n}.jsonl", self.attack / f"judge2_{self.n}.jsonl",
                      self.attack / f"accepted_{self.n}.jsonl", self.attack / f"built_{self.n}.jsonl",
-                     self.attack / f"kept_{self.n}.jsonl", self.attack / f"records_{self.n}", self.golden,
+                     self.attack / f"kept_{self.n}.jsonl", self.attack / f"records_{self.n}",
+                     self.attack / f"search_{self.n}.json", self.golden,
                      self.golden.with_suffix(".report.json"), ROOT / "loop" / "defender" / f"brief_{self.n}.md",
                      ROOT / "loop" / "defender" / f"notes_{self.n}.md", ROOT / "loop" / "critic" / f"code_{self.n}.json"):
             set_aside(path, stale)
@@ -856,8 +972,9 @@ class Loop:
             name = "attacker" if attempt == 1 else "attacker_rewrite"
             set_aside(search, stale)
             before = file_digest(spec_file)
-            self.guarded("attacker", f"2-attack-{attempt}", self.prompt(name),
-                         (f"loop/attack/spec_{self.n}.jsonl", f"loop/attack/spec_{self.n}.search.md"), output=spec_file)
+            self.attacker_log = self.guarded(
+                "attacker", f"2-attack-{attempt}", self.prompt(name),
+                (f"loop/attack/spec_{self.n}.jsonl", f"loop/attack/spec_{self.n}.search.md"), output=spec_file)
             code, report = self.last_exit, read_text(search).strip()
             wrote = spec_file.is_file() and file_digest(spec_file) != before
             if wrote or (attempt == 2 and code == 0 and spec_file.is_file()):  # (a rewrite may leave it as it was)
@@ -897,6 +1014,51 @@ class Loop:
             shutil.copy(judge_file, self.attack / f"judge1_{self.n}.try1.jsonl")
         raise Stop("unreachable")
 
+    def search_tries(self) -> dict[str, int] | None:
+        """How often the attacker's last run called its search tools (SEARCH_TOOLS), counted in its log. None: the
+        log is not one that shows tool calls."""
+        inputs = tool_inputs(self.attacker_log) if self.attacker_log is not None and self.attacker_log.is_file() else None
+        if inputs is None:
+            return None
+        return {tool: sum(text.count(tool) for text in inputs) for tool in SEARCH_TOOLS}
+
+    def search_review(self) -> str:
+        """Too few weaknesses ends the whole run as complete, and that rests on the attacker's own report of what it
+        searched. The report is checked before it counts: by the script (an attacker that never ran a question has
+        not searched) and by the critic, who compares it with the attacker's log and the state of the scores.
+        Returns the critic's reason when the search is accepted. Stop when it is not: the next loop attacks again.
+        Fault "tools" when the search tools did not work: then too few weaknesses means nothing."""
+        tries = self.search_tries()
+        self.note("탐색 보고 심사", **(tries or {"tool_calls": "알 수 없음"}))
+        if tries is not None and tries["try_question.py"] == 0:
+            raise Stop("탐색 부족: 공격자의 실행 기록에 질문을 돌려 본 흔적이 없음 (try_question.py 0번). 목표 완료로 "
+                       "기록하지 않음")
+        file = self.attack / f"search_{self.n}.json"
+        may = ("loop/attack/", "loop/critic/")
+        counted = "알 수 없음 (공격자의 로그가 도구 호출을 보여 주는 형식이 아님)" if tries is None else \
+            ", ".join(f"{tool} {count}번" for tool, count in tries.items())
+        log = self.attacker_log.relative_to(ROOT).as_posix() if self.attacker_log is not None else "(없음)"
+        data, note = None, ""
+        for attempt in (1, 2):
+            text = self.prompt("critic_search", ATTACK_LOG=log, TRIES=counted, NOTE=note)
+            self.guarded("critic", f"3-search-{attempt}", text, may, output=file)
+            data, lacking = read_review(file, ("enough", "not_enough", "tools_failed"),
+                                        {"enough": ("searched", "tried", "remaining")})
+            if data is not None and not lacking:
+                break
+            note = ("\n앞서 쓴 심사 파일은 쓸 수 없었다: " + ("`verdict`가 정해진 값이 아니다" if data is None else
+                                                    "다음 항목이 비어 있다: " + ", ".join(lacking)) + ". 파일 전체를 다시 쓴다.\n")
+        else:
+            self.need(file, "평가자", "탐색 보고 심사")
+            raise Fault("format", f"출력 형식 오류: 평가자의 탐색 보고 심사({file.name})를 다시 요청해도 쓸 수 없음")
+        reason = self.safe(str(data["reason"]).strip())[:150]
+        self.note("탐색 보고 심사 결과", verdict=data["verdict"])
+        if data["verdict"] == "tools_failed":
+            raise Fault("tools", f"공격자의 탐색 도구가 동작하지 않아 약점이 더 없는지 판단할 수 없음: {reason}")
+        if data["verdict"] == "not_enough":
+            raise Stop(f"탐색 부족: 평가자가 공격자의 탐색 보고를 받아들이지 않음 ({reason}). 목표 완료로 기록하지 않음")
+        return reason
+
     def attack_items(self, specs: list[dict]) -> list[dict]:
         accepted = self.attack / f"accepted_{self.n}.jsonl"
         write_jsonl(accepted, specs)
@@ -906,8 +1068,17 @@ class Loop:
         except ValueError:
             raise Fault("script", f"값을 채운 문항 파일을 읽지 못함 ({self.golden.name}, {self.log})") from None
         self.note("값 채우기", built=len(items), specs=len(specs), exit=done.returncode)
-        if done.returncode not in (0, 1) or (done.returncode != 0 and items):  # 1 without items: every spec rejected
-            raise Fault("script", f"값 채우기·검증 스크립트가 실패함 (exit {done.returncode}, {self.log})")
+        # exit 1 without items is "every spec rejected" only when the builder says so in its report (one entry per
+        # spec); a builder that died leaves no report, and that is not a judgment of the specs
+        report = self.golden.with_suffix(".report.json")
+        try:
+            reported = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else None
+        except (OSError, ValueError):
+            reported = None
+        told = isinstance(reported, dict) and len(reported) >= len(specs)
+        if done.returncode not in (0, 1) or (done.returncode != 0 and items) or not told:
+            raise Fault("script", f"값 채우기·검증 스크립트가 실패함 (exit {done.returncode}, 보고서 "
+                                  f"{'있음' if told else '없음'}, {self.log})")
         low = self.s.attack_min
         if items:
             shutil.copy(self.golden, self.attack / f"built_{self.n}.jsonl")
@@ -1000,57 +1171,114 @@ class Loop:
         self.row["verify"] = "pass" if done.returncode == 0 else "fail"
         return done.returncode == 0
 
-    def tests_before(self) -> str:
-        """Whether the tests the defender added or changed (tests/loop) fail on the code before the fix: a test that
-        passes there too does not show that this loop's change works. One sentence for the critic; never a reason
-        of its own to revert. The code before the fix is HEAD, unpacked outside the clone."""
-        changes = self.clone_changes()
-        tests = [p for p in changes if p.startswith("tests/loop/") and p.endswith(".py")
-                 and Path(p).name.startswith("test_") and (self.s.clone / p).is_file()]
-        if not tests:
-            return "방어자가 이번에 추가하거나 고친 테스트가 없음 (tests/loop)"
-        if any(p.startswith("kosis_chat/shared/") or p == "kosis_chat/prepare/index.py" for p in changes):
-            return (f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드로는 돌려 보지 않음 (색인 코드가 바뀌어, 돌리면 큰 표의 "
-                    f"저장된 색인을 다시 만들게 됨)")
-        try:
-            with tempfile.TemporaryDirectory(prefix="kosis_loop_head_", ignore_cleanup_errors=True) as tmp:
-                pack, head = Path(tmp) / "head.tar", Path(tmp) / "head"
-                if self.git("archive", "--format=tar", "-o", str(pack), "HEAD").returncode != 0:
-                    return f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드를 꺼내지 못해 확인하지 못함"
-                with tarfile.open(pack) as tar:
-                    try:
-                        tar.extractall(head, filter="data")
-                    except TypeError:  # a Python without extraction filters
-                        tar.extractall(head)
-                for rel in changes:  # the new tests and what they import from tests/loop
-                    src = self.s.clone / rel
-                    if rel.startswith("tests/loop/") and src.is_file():
-                        (head / rel).parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy(src, head / rel)
-                env = os.environ | {"PYTHONPATH": os.pathsep.join([str(head), str(head / "src")])}
-                done = subprocess.run([self.s.python, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"], cwd=head,
-                                      env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                      timeout=TESTS_BEFORE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드에서 {TESTS_BEFORE_TIMEOUT}초 안에 끝나지 않아 확인하지 못함"
-        except (OSError, tarfile.TarError) as exc:
-            return f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드로 돌리지 못함 ({type(exc).__name__})"
-        with self.log.open("a", encoding="utf-8") as f:
-            f.write(f"$ pytest {' '.join(tests)} (on HEAD, before the fix)\n{done.stdout}{done.stderr}\n(exit {done.returncode})\n")
-        head_text = f"추가·수정된 테스트 파일 {len(tests)}개를 수정 전 코드에서 돌린 결과: "
-        if done.returncode == 0:
-            return head_text + "모두 통과함. 수정 전에도 통과하므로 이번 수정을 검증하는 테스트가 아님"
-        if done.returncode == 1:
-            failed = sum(1 for line in done.stdout.splitlines() if line.startswith("FAILED "))
-            return head_text + (f"{failed}건이 실패함" if failed else "실패가 있음") + ". 수정 후에는 verify에서 모두 통과함"
-        if done.returncode == 2:
-            return head_text + "테스트를 불러오지 못함. 이번에 추가한 코드를 쓰는 테스트이면 정상이고, 수정 후에는 verify에서 통과함"
-        return head_text + f"확인하지 못함 (pytest exit {done.returncode})"
+    def test_cases(self, tree: Path, tests: list[str], label: str) -> tuple[int, dict[str, str]] | None:
+        """Runs the test files in a copy of the code (cwd `tree`) and reads each test's result from pytest's own
+        report: (pytest's exit code, test id -> "passed" | "failed" | "skipped"). A file that cannot be imported is
+        one failed entry of its own. None when the run did not happen or left no report."""
+        with tempfile.TemporaryDirectory(prefix="kosis_loop_tests_", ignore_cleanup_errors=True) as tmp:
+            report = Path(tmp) / "report.xml"
+            env = os.environ | {"PYTHONPATH": os.pathsep.join([str(tree), str(tree / "src")])}
+            done = subprocess.run([self.s.python, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider",
+                                   f"--junitxml={report}", "-o", "junit_family=xunit2"], cwd=tree, env=env,
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=TESTS_BEFORE_TIMEOUT)
+            with self.log.open("a", encoding="utf-8") as f:
+                f.write(f"$ pytest {' '.join(tests)} ({label})\n{done.stdout}{done.stderr}\n(exit {done.returncode})\n")
+            if done.returncode not in (0, 1, 2, 5):
+                return None
+            try:
+                cases = ElementTree.parse(report).getroot().iter("testcase")
+            except (OSError, ElementTree.ParseError):
+                return None
+            found: dict[str, str] = {}
+            for case in cases:
+                name = f"{case.get('classname') or ''}::{case.get('name') or ''}"
+                kinds = {child.tag for child in case}
+                found[name] = "failed" if kinds & {"failure", "error"} else "skipped" if "skipped" in kinds else "passed"
+            return done.returncode, found
 
-    def records(self, items: list[dict], outcome: str, changed: bool) -> tuple[bool, str]:
+    def tests_before(self) -> tuple[str, str]:
+        """Whether the tests the defender added or changed (tests/loop and its subfolders) show this loop's change:
+        the same test files are run on the code before the fix (HEAD, unpacked outside the clone) and on the clone,
+        and a test counts when it fails (or its file cannot be imported) before and passes after, by test id.
+        Returns (state, a sentence for the record). state "failed": at least one such test, and none failing after.
+        Reasons to revert: "none" (no test added or changed), "passed" (nothing fails before the fix), "unproven"
+        (what fails before does not pass after) and "unknown" (the runs could not be read, tried twice).
+        "skipped" (the code before the fix is not run: the index code changed) leaves it to the critic, which then
+        has to say in its judgment why the test would fail there (records)."""
+        changes = self.clone_changes()
+        tests = sorted(p for p in changes if p.startswith("tests/loop/") and p.endswith(".py")
+                       and Path(p).name.startswith("test_") and (self.s.clone / p).is_file())
+        if not tests:
+            return "none", "방어자가 이번에 추가하거나 고친 테스트가 없음 (tests/loop)"
+        if any(p.startswith("kosis_chat/shared/") or p == "kosis_chat/prepare/index.py" for p in changes):
+            return "skipped", (f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드로는 돌려 보지 않음 (색인 코드가 바뀌어, 돌리면 "
+                               f"큰 표의 저장된 색인을 다시 만들게 됨). 이 테스트가 이번 수정을 검증하는지는 평가자가 판단하고, "
+                               f"수정 전 코드에서 실패하는 이유를 판정 파일의 before_fix에 적음")
+        head_text = f"추가·수정된 테스트 파일 {len(tests)}개를 수정 전 코드와 수정 후 코드에서 돌린 결과: "
+        why = "확인하지 못함"
+        for attempt in (1, 2):  # a run that could not be read is tried once more
+            try:
+                with tempfile.TemporaryDirectory(prefix="kosis_loop_head_", ignore_cleanup_errors=True) as tmp:
+                    pack, head = Path(tmp) / "head.tar", Path(tmp) / "head"
+                    if self.git("archive", "--format=tar", "-o", str(pack), "HEAD").returncode != 0:
+                        why = "수정 전 코드를 꺼내지 못함"
+                        continue
+                    with tarfile.open(pack) as tar:
+                        try:
+                            tar.extractall(head, filter="data")
+                        except TypeError:  # a Python without extraction filters
+                            tar.extractall(head)
+                    for rel in changes:  # the new tests and what they import from tests/loop
+                        src = self.s.clone / rel
+                        if rel.startswith("tests/loop/") and src.is_file():
+                            (head / rel).parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy(src, head / rel)
+                    before = self.test_cases(head, tests, "on HEAD, before the fix")
+                after = self.test_cases(self.s.clone, tests, "on the clone, after the fix")
+            except subprocess.TimeoutExpired:
+                why = f"{TESTS_BEFORE_TIMEOUT}초 안에 끝나지 않음"
+                continue
+            except (OSError, tarfile.TarError) as exc:
+                why = f"돌리지 못함 ({type(exc).__name__})"
+                continue
+            if before is None or after is None:
+                why = "pytest의 결과를 읽지 못함"
+                continue
+            break
+        else:
+            return "unknown", head_text + f"{why} (두 번 시도함). 수정 전 실패를 확인하지 못해 유지하지 않음"
+        (code, was), (code_after, now) = before, after
+        broken = sorted(i for i, result in was.items() if result == "failed")
+        still = sorted(i for i, result in now.items() if result == "failed")
+        proven = sorted(i for i, result in now.items() if result == "passed" and was.get(i) != "passed")
+        if code == 5 or (not was and code == 0):
+            return "none", head_text + "테스트가 하나도 없음"
+        if not broken:
+            return "passed", head_text + "수정 전 코드에서 실패하는 테스트가 없음. 수정 전에도 통과하므로 이번 수정을 검증하는 테스트가 아님"
+        counts = (f"수정 전 {len(broken)}건이 실패함" + (" (불러오지 못한 테스트 파일 포함)" if code == 2 else "")
+                  + f", 수정 후 통과 {sum(1 for r in now.values() if r == 'passed')}건·실패 {len(still)}건·건너뜀 "
+                    f"{sum(1 for r in now.values() if r == 'skipped')}건")
+        if still or code_after not in (0,):
+            return "unproven", head_text + counts + ". 수정 후에도 실패하는 테스트가 있음"
+        if not proven:
+            return "unproven", head_text + counts + ". 수정 전에 실패한 테스트 가운데 수정 후에 통과한 것이 없음"
+        return "failed", head_text + counts + f". 수정 전에 실패하고 수정 후에 통과한 테스트 {len(proven)}건"
+
+    def safe(self, text: str) -> str:
+        """A text on its way to loop/results.tsv, loop/faults.tsv, the console or a commit message, which the defender
+        can read: as it is, or a placeholder when it holds item content (of this loop's specs and items or of an
+        earlier attack set)."""
+        known = set_items(attack_sets() + [self.attack / f"built_{self.n}.jsonl", self.attack / f"spec_{self.n}.jsonl"])
+        return "(문항 내용이 섞여 있어 적지 않음)" if leaks(text, known) else text
+
+    def records(self, items: list[dict], outcome: str, changed: bool, tested: str = "") -> tuple[bool, str]:
         """The critic's judgment of the change (when the clone has one) and its record of the loop, which every loop
         that got this far leaves: also one whose attack was already all right, or whose defender changed nothing.
-        Returns (accepted, reason); (False, "") without a change.
+        Returns (accepted, reason); (False, "") without a change. An accepted change is recorded with what was
+        fixed, the test that shows it and what still fails; when the script did not run the tests on the code before
+        the fix (tested "skipped"), also with why they would fail there (before_fix): the critic stands in for that
+        check and says on what it rests.
 
         The record files are what the next defender reads. The critic writes drafts of them where the defender
         cannot read (loop/attack/records_N/); the script checks what the drafts add for item content and only then
@@ -1071,19 +1299,25 @@ class Loop:
         file.parent.mkdir(parents=True, exist_ok=True)
         may = ("loop/critic/", "loop/attack/")
         accepted, why = False, ""
+        needs = {"accept": ("cause", "tests", "remaining") + (("before_fix",) if tested == "skipped" else ())}
         if changed:
+            note = ""
             for attempt in (1, 2):
-                self.guarded("critic", f"10-review-{attempt}", self.prompt("critic_code"), may, staged=True, output=file)
-                try:
-                    verdict = json.loads(file.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    verdict = None
-                if isinstance(verdict, dict) and verdict.get("verdict") in ("accept", "reject"):
-                    accepted, why = verdict["verdict"] == "accept", str(verdict.get("reason") or "")
+                self.guarded("critic", f"10-review-{attempt}", self.prompt("critic_code", NOTE=note), may, staged=True,
+                             output=file)
+                verdict, lacking = read_review(file, ("accept", "reject"), needs)
+                if verdict is not None and not lacking:
+                    accepted, why = verdict["verdict"] == "accept", str(verdict["reason"])
                     break
+                self.note("수정 판정을 쓸 수 없어 다시 요청", lacking=",".join(lacking))
+                note = ("\n앞서 쓴 판정 파일은 쓸 수 없었다: " + ("`verdict`가 `accept`도 `reject`도 아니다" if verdict is None
+                                                        else "다음 항목이 비어 있다: " + ", ".join(lacking))
+                        + ". 판정 파일 전체를 다시 쓴다. 기록 초안은 이미 썼으면 다시 쓰지 않는다.\n")
             else:  # not a rejection: nobody judged the change
                 self.need(file, "평가자", "수정 판정")
-                raise Fault("format", f"출력 형식 오류: 평가자의 수정 판정({file.name})에 verdict가 accept도 reject도 아님")
+                raise Fault("format", f"출력 형식 오류: 평가자의 수정 판정({file.name})을 다시 요청해도 쓸 수 없음 "
+                                      f"(verdict가 accept도 reject도 아니거나, accept에 {'·'.join(needs['accept'])} "
+                                      f"가운데 빈 항목이 있음)")
         else:
             self.guarded("critic", "10-note", self.prompt("critic_note"), may, output=drafts / "log.md")
 
@@ -1106,6 +1340,17 @@ class Loop:
             self.guarded("critic", "10-record-rewrite", text, may, staged=changed)
             found = spilled()
             self.note("다시 쓴 기록 초안 검사", leaks=len(found))
+            if changed:
+                # the judgment file as it now stands is what is kept and committed: it has to be a whole judgment
+                # and the one the script acted on. Otherwise nobody's judgment stands behind a commit.
+                again, lacking = read_review(file, ("accept", "reject"), needs)
+                if again is None or lacking or (again["verdict"] == "accept") != accepted:
+                    self.note("다시 쓴 판정 파일을 쓸 수 없음", lacking=",".join(lacking),
+                              verdict=str(again.get("verdict")) if again else "없음")
+                    raise Fault("format", f"출력 형식 오류: 문항 내용을 지우려고 다시 쓴 수정 판정({file.name})이 처음 판정과 "
+                                          f"다르거나 근거 항목이 비어 있음")
+                why = str(again["reason"])
+        why = self.safe(why)  # it goes to loop/results.tsv and to a commit message
         where = drafts.relative_to(ROOT).as_posix()
         if found:
             moved = any(x.startswith(file.name) for x in found)
@@ -1142,30 +1387,43 @@ class Loop:
         self.row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         dev = self.measure_dev("dev-before")
         if self.broken(dev):
-            raise Fault("measure", f"기준 데이터 측정에 오류가 있음 ({dev.get('run')}, {self.log})")
-        self.row["dev_before"] = f"{dev['score']:.4f}"
-        self.note("기준 점수", score=self.row["dev_before"], reused=bool(dev.get("reused")), errors=dev["errors"])
+            raise Fault("measure", f"기준 데이터 측정을 쓸 수 없음 ({self.trouble(**{'기준 데이터': dev})}; "
+                                   f"{dev.get('run')}, {self.log})")
+        if dev["items"] and dev["errors"] / dev["items"] >= DEV_ERROR_SHARE:
+            raise Fault("measure", f"기준 데이터 {dev['items']}건 가운데 {dev['errors']}건이 오류로 끝남: 코드의 약점이 "
+                                   f"아니라 실행이 되지 않는 것으로 봄 ({dev.get('run')}, {self.log})")
+        self.row |= {"dev_before": f"{dev['score']:.4f}", "dev_strict_before": f"{dev['strict']:.4f}"}
+        self.note("기준 점수", score=self.row["dev_before"], strict=self.row["dev_strict_before"],
+                  reused=bool(dev.get("reused")), errors=dev["errors"])
 
         try:
             specs = self.attack_specs(dev)
-        except Short as short:  # GOAL.md's completion: too few weaknesses found, and verify passes
+        except Short as short:  # GOAL.md's completion: too few weaknesses found, the search accepted, verify passes
+            accepted = self.search_review()
             self.note("약점 부족으로 끝남: 최종 verify 실행")
             if self.verify():
-                raise Done(f"목표 완료: {short}, 최종 verify 통과") from None
+                raise Done(f"목표 완료: {short}, 평가자가 탐색 보고를 받아들임 ({accepted}), 최종 verify 통과") from None
             raise Stop(f"{short}. 그러나 최종 verify가 실패해 목표 완료로 기록하지 않음 ({self.log})") from None
         items = self.attack_items(specs)
         attack, past = self.measure("attack-before", self.golden), self.measure_past("past-before")
         if self.broken(attack, past):
-            raise Fault("measure", f"수정 전 측정에 오류가 있음 ({self.log})")
-        self.row["attack_before"] = f"{attack['score']:.4f}"
-        self.row["past_before"] = "-" if past is None else f"{past['score']:.4f}"
-        self.note("수정 전 점수", attack=self.row["attack_before"], past=self.row["past_before"],
-                  errors=attack["errors"] + (past["errors"] if past else 0))
-        if attack["score"] >= 1 - EPS:
+            raise Fault("measure", f"수정 전 측정을 쓸 수 없음 ({self.trouble(**{'이번 공격 문항': attack, '지난 공격 문항': past})}; "
+                                   f"{self.log})")
+
+        def pair(part: dict | None) -> tuple[str, str]:
+            return ("-", "-") if part is None else (f"{part['score']:.4f}", f"{part['strict']:.4f}")
+
+        self.row["attack_before"], self.row["attack_strict_before"] = pair(attack)
+        self.row["past_before"], self.row["past_strict_before"] = pair(past)
+        self.note("수정 전 점수", attack=self.row["attack_before"], attack_strict=self.row["attack_strict_before"],
+                  past=self.row["past_before"], errors=attack["errors"] + (past["errors"] if past else 0))
+        if attack["strict"] >= 1 - EPS:  # (the same-inputs score is never above the plain one: both are full)
             self.row |= {"kept": "0", "reason": "공격 문항을 이미 모두 맞힘"}
-            self.records(items, f"# 루프 {self.n} 결과\n\n- 이번 공격 문항(수정 전): {self.row['attack_before']}\n"
+            self.records(items, f"# 루프 {self.n} 결과\n\n- 이번 공격 문항(수정 전): {self.row['attack_before']} "
+                                f"(칸 일치 점수 {self.row['attack_strict_before']})\n"
                                 f"- 지난 공격 문항(수정 전): {self.row['past_before']}\n"
-                                f"- 스크립트 판정: 수정 없음. 수정 전 코드가 이번 공격 문항을 이미 모두 맞혀 방어자를 부르지 않음.\n",
+                                f"- 스크립트 판정: 수정 없음. 수정 전 코드가 이번 공격 문항을 계산에 쓴 칸까지 이미 모두 맞혀 "
+                                f"방어자를 부르지 않음.\n",
                          changed=False)
             return False
 
@@ -1174,24 +1432,53 @@ class Loop:
         self.handoff("방어자 실행 뒤")
         if problem is None and not self.verify():
             problem = "verify 실패"
-        metrics, dev2 = "", None
+        metrics, dev2, tested = "", None, ""
         if problem is None:
-            metrics = f"- 방어자의 테스트: {self.tests_before()}\n"
+            tested, tests_text = self.tests_before()
+            metrics = f"- 방어자의 테스트: {tests_text}\n"
             dev2, attack2, past2 = self.measure_dev("dev-after"), self.measure("attack-after", self.golden), \
                 self.measure_past("past-after")
+            if any(part is not None and part["unread"] for part in (dev2, attack2, past2)):
+                # not the change's doing as far as anyone can tell: nothing is decided about it (unfinished.diff)
+                raise Fault("measure", "수정 후 측정을 쓸 수 없음 (" + self.trouble(
+                    **{"기준 데이터": dev2, "이번 공격 문항": attack2, "지난 공격 문항": past2}) + f"; {self.log})")
             if self.broken(dev2, attack2, past2):
                 problem = "수정 후 측정에 오류가 있음"
             else:
-                self.row |= {"dev_after": f"{dev2['score']:.4f}", "attack_after": f"{attack2['score']:.4f}",
-                             "past_after": "-" if past2 is None else f"{past2['score']:.4f}"}
-                failed = [text for bad, text in (
-                    (dev2["score"] < dev["score"] - EPS, "기준 데이터 점수가 떨어짐"),
-                    (attack2["score"] <= attack["score"] + EPS, "이번 공격 문항 점수가 오르지 않음"),
-                    (past is not None and past2["score"] < past["score"] - EPS, "지난 공격 문항 점수가 떨어짐")) if bad]
+                self.row["dev_after"], self.row["dev_strict_after"] = pair(dev2)
+                self.row["attack_after"], self.row["attack_strict_after"] = pair(attack2)
+                self.row["past_after"], self.row["past_strict_after"] = pair(past2)
+                # dev and the earlier attacks may not fall, by the plain score nor by the same-inputs score. This
+                # attack has to rise by the same-inputs score (a number that equals the answer but is made from other
+                # cells raises the plain score alone: evals/grade.py) and may not fall by the plain one: a fix that
+                # only makes the right cells be read is an improvement too.
+                failed = []
+                for name, before, after in (("기준 데이터", dev, dev2), ("지난 공격 문항", past, past2)):
+                    if before is None:
+                        continue
+                    for key, label in (("score", "점수"), ("strict", "칸 일치 점수")):
+                        if after[key] < before[key] - EPS:
+                            failed.append(f"{name} {label}가 떨어짐")
+                            break  # (the plain score says it; the same-inputs score is not named on top)
+                if attack2["score"] < attack["score"] - EPS:
+                    failed.append("이번 공격 문항 점수가 떨어짐")
+                elif attack2["strict"] <= attack["strict"] + EPS:
+                    failed.append("이번 공격 문항 " + ("칸 일치 점수" if attack2["score"] > attack["score"] + EPS else "점수")
+                                  + "가 오르지 않음")
+                if tested == "none":
+                    failed.append("이번 수정을 검증하는 테스트를 방어자가 추가하지 않음")
+                elif tested == "passed":
+                    failed.append("방어자의 테스트가 수정 전 코드에서도 통과해 이번 수정을 검증하지 못함")
+                elif tested == "unproven":
+                    failed.append("방어자의 테스트 가운데 수정 전에 실패하고 수정 후에 통과한 것이 없음")
+                elif tested == "unknown":
+                    failed.append("방어자의 테스트를 수정 전 코드에서 확인하지 못함")
                 problem = ", ".join(failed) or None
-                metrics = (f"- 기준 데이터(판정용): {self.row['dev_before']} → {self.row['dev_after']}\n"
-                           f"- 이번 공격 문항: {self.row['attack_before']} → {self.row['attack_after']}\n"
-                           f"- 지난 공격 문항: {self.row['past_before']} → {self.row['past_after']}\n") + metrics
+                metrics = "".join(
+                    f"- {name}: {self.row[f'{key}_before']} → {self.row[f'{key}_after']} (칸 일치 점수 "
+                    f"{self.row[f'{key}_strict_before']} → {self.row[f'{key}_strict_after']})\n"
+                    for name, key in (("기준 데이터(판정용)", "dev"), ("이번 공격 문항", "attack"), ("지난 공격 문항", "past"))
+                ) + metrics
         self.note("유지 조건", problem=problem or "없음")
 
         changed = bool(self.clone_changes())
@@ -1199,7 +1486,7 @@ class Loop:
                    + ("유지 조건을 모두 만족함. 평가자의 판정에 따라 유지 또는 되돌림.\n" if problem is None
                       else f"되돌림 ({problem}). 평가자의 판정과 관계없이 되돌림.\n" if changed
                       else f"수정 없음 ({problem}).\n"))
-        accepted, why = self.records(items, outcome, changed)
+        accepted, why = self.records(items, outcome, changed, tested)
         if problem is None and not accepted:
             problem = f"평가자가 거부함: {why}"
         if problem is None:
@@ -1236,6 +1523,7 @@ def record(row: dict) -> None:
     if old_header and rows:
         shutil.move(str(file), str(fresh(file.with_name("results.single-agent.tsv"))))
         rows = []
+    rows = [r + ["-"] * (len(RESULTS_HEADER) - len(r)) for r in rows]  # rows written before a column was added
     rows.append([str(row[k]).replace("\t", " ").replace("\n", " ") for k in RESULTS_HEADER])
     file.write_text("\n".join("\t".join(r) for r in [RESULTS_HEADER, *rows]) + "\n", encoding="utf-8")
 
@@ -1279,11 +1567,21 @@ def preflight(s: Settings) -> list[str]:
                 *(f"loop/prompts/{n}.md" for n in ("critic_hint", "attacker", "attacker_rewrite", "critic_judge1",
                                                    "critic_judge2", "critic_judge_rest", "critic_brief",
                                                    "critic_brief_rewrite", "defender", "critic_code", "critic_note",
-                                                   "critic_record_rewrite"))):
+                                                   "critic_record_rewrite", "critic_search"))):
         if not (ROOT / rel).exists():
             problems.append(f"파일이 없음: {rel}")
     if s.vault.exists() and any(s.vault.iterdir()):
         problems.append(f"보관 폴더에 남은 것이 있음: {s.vault} (bash scripts/loop.sh --restore)")
+    try:  # the table tools (scripts/show_table.py, try_question.py) and Phase 1 read the tables with it
+        found = subprocess.run([s.python, "-c", "import pyarrow; print(pyarrow.__version__)"], capture_output=True,
+                               text=True, timeout=120).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        found = ""
+    if not found.split(".")[0].isdigit():
+        problems.append(f"PYTHON({s.python})에서 pyarrow를 불러오지 못함")
+    elif int(found.split(".")[0]) < PYARROW_MIN:
+        problems.append(f"pyarrow {found}: {PYARROW_MIN} 이상이 필요함 (Phase 1의 요구 사항. 낮은 버전에서는 표 보기 도구가 "
+                        f"일부 표를 읽지 못함)")
     return problems
 
 
@@ -1307,7 +1605,7 @@ def verify(s: Settings) -> int:
     if store_tests:
         # without the comparison over every real table of the workspace: it takes long, a person runs it
         steps.append([s.python, "-m", "pytest", *store_tests, "-q", "-p", "no:cacheprovider", "-k", "not provided_tables"])
-    if any((s.clone / "tests" / "loop").glob("test_*.py")):
+    if any((s.clone / "tests" / "loop").rglob("test_*.py")):  # subfolders too: what tests_before runs
         steps.append([s.python, "-m", "pytest", "tests/loop", "-q", "-p", "no:cacheprovider"])
     for step in steps:
         code = subprocess.run(step, cwd=s.clone, env=env).returncode
@@ -1370,21 +1668,19 @@ def main(argv: list[str] | None = None) -> int:
                 (loop.dir / "crash.txt").write_text(traceback.format_exc(), encoding="utf-8")
                 raise Fault("crash", f"실행기 오류 {type(exc).__name__}: {str(exc)[:200]} ({loop.dir.name}/crash.txt)") from None
         except Fault as fault:  # not a result of the loop: no row, the same loop number runs again next time
-            saved = unwind(loop)
-            reason = f"운영 오류({fault.kind}): {fault}" + (f". 클론의 수정은 {saved}에 남기고 되돌림" if saved else "")
-            reason += f". 다시 실행하면 루프 {n}부터 다시 함"
+            reason = f"운영 오류({fault.kind}): {fault}" + unwind(loop) + f". 다시 실행하면 루프 {n}부터 다시 함"
             record_fault(n, fault)
             code = 1
             break
         except Stop as stop:  # a rule of the loop ended the run: done, blocked or stop
-            saved = unwind(loop)
-            reason = str(stop) + (f". 클론의 수정은 커밋하지 않고 {saved}에 남김" if saved else "")
+            reason = loop.safe(str(stop)) + unwind(loop)
             loop.row |= {"kept": stop.kept, "reason": reason[:300]}
             record(loop.row)
             reason = {"done": "", "blocked": "사람에게 넘김: ", "stop": "중단: "}[stop.kept] + reason
             break
         finally:
             Vault(s.vault).restore()
+        loop.row["reason"] = loop.safe(loop.row["reason"])
         record(loop.row)
         say(f"loop {n} 끝: kept={loop.row['kept']} ({loop.row['reason']})")
         if loop.after_stop:
@@ -1399,11 +1695,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def unwind(loop: Loop) -> str:
     """Leave the clone and the item files as a run that ended early must: a change in the clone saved as a diff and
-    reset, items that are not a finished attack set moved away. Returns where the diff is ('' when none)."""
-    saved = loop.shelve("unfinished.diff")
+    reset (left in the clone when it cannot be saved), items that are not a finished attack set moved away. Returns
+    a sentence about the clone's change ('' when it had none)."""
+    told = loop.put_away("unfinished.diff")
     if not loop.final_items:  # no judgment finished, or too few passed: not an attack set for later loops
         set_aside(loop.golden, loop.dir / "stale")
-    return saved
+    return told
 
 
 if __name__ == "__main__":

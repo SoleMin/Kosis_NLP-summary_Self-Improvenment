@@ -74,7 +74,9 @@ def load_table(path: Path, refs=None):
     from tablescan import TableFile, ref_column
 
     tf = TableFile(path)
-    codes = [f"dim{i}_code" for i in range(1, 9) if f"dim{i}_code" in tf.schema.names]
+    levels = [i for i in range(1, 9) if f"dim{i}_code" in tf.schema.names and f"dim{i}_name" in tf.schema.names]
+    codes = [f"dim{i}_code" for i in levels]
+    category_names = [f"dim{i}_name" for i in levels]  # a category is part of a coordinate on the rows that name it
     wanted = parts = None
     groups = tf.row_groups()
     if refs is not None:
@@ -86,7 +88,7 @@ def load_table(path: Path, refs=None):
         groups = tf.row_groups_any([tf.equals("period", p) for p in sorted(parts["period"])])
     rows = defaultdict(list)
     for group in groups:
-        keys = tf.read(group, ["tbl_id", "item_id", *codes, "period"])
+        keys = tf.read(group, ["tbl_id", "item_id", *codes, *category_names, "period"])
         at = pa.array(np.arange(keys.num_rows))
         if parts is not None:
             at = pa.array(may_match(keys, parts, codes, len(wanted)))
@@ -122,26 +124,42 @@ def ref_parts(refs: list[str]) -> dict[str, dict[str, int]]:
 
 def may_match(keys, parts: dict[str, dict[str, int]], codes: list[str], n_refs: int):
     """Positions of the rows that could have one of the refs' coordinates: for some ref, every text column holds a
-    text that ref allows (a missing code is allowed: it is left out of the coordinate). Worked out with bit sets
+    text that ref allows (a missing code is allowed, and so is any code of a category the row does not name: that
+    category is not in the coordinate). Worked out with bit sets
     (64 refs at a time) on each column's dictionary, period first and then only on the rows still left, so it is
     cheap and few rows are left for the exact check. Other column types are left to that check."""
     import numpy as np
     import pyarrow as pa
+    from tablescan import named_rows
+
+    def unnamed(code: str):
+        """Rows on which the category of this code column has no name (None when the name column is not there)."""
+        name = code[:-len("code")] + "name"
+        if name not in keys.column_names:
+            return None
+        col = keys[name].combine_chunks()
+        if pa.types.is_dictionary(col.type):  # worked out on the few names, not on every row
+            empty = np.array([not text for text in col.dictionary.to_pylist()] + [True], bool)
+            return empty[col.indices.fill_null(len(col.dictionary)).to_numpy()]
+        return ~named_rows(col).to_numpy(zero_copy_only=False)
 
     columns = []
-    for name in sorted(keys.column_names, key=lambda c: c != "period"):
+    for name in sorted((c for c in keys.column_names if not c.endswith("_name")), key=lambda c: c != "period"):
         col = keys[name].combine_chunks()
         if pa.types.is_dictionary(col.type) and pa.types.is_string(col.type.value_type):
             texts = col.dictionary.to_pylist()
             index = col.indices.fill_null(len(texts)).to_numpy()  # the last entry stands for a missing value
-            columns.append((parts["code" if name in codes else name], texts, index, name in codes))
+            columns.append((parts["code" if name in codes else name], texts, index, name in codes,
+                            unnamed(name) if name in codes else None))
     found = [np.arange(keys.num_rows)[:0]]
     for word in range(0, max(n_refs, 1), 64):
         rows, alive = np.arange(keys.num_rows), None
-        for allowed, texts, index, may_miss in columns:
+        for allowed, texts, index, may_miss, free in columns:
             bits = np.array([(allowed.get(t, 0) >> word) & (2**64 - 1) for t in texts] + [2**64 - 1 if may_miss else 0],
                             np.uint64)
             mine = bits[index[rows]]
+            if free is not None:
+                mine = np.where(free[rows], np.uint64(2**64 - 1), mine)
             alive = mine if alive is None else alive & mine
             left = alive != 0
             rows, alive = rows[left], alive[left]

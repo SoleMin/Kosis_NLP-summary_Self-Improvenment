@@ -2,10 +2,12 @@
 
 Some tables have over 100 million rows, so no tool reads a whole table. The tools used to compare and print values
 as pandas shows the whole table (`df[col].astype(str)`); TableFile keeps that meaning: `equals` and `texts` treat a
-value as the text pandas would make of it. A missing value (null, NaN) never matches any text and never becomes part
-of a coordinate, whatever pandas version is installed (pandas 2 turned it into the text "None" or "nan" there;
-show_table.ref_of, too, leaves a coordinate with a missing part NaN, as pandas 3 does). An integer column with a
-null anywhere in the file is float64 in pandas ("2023.0"), so that is looked up in the file footer.
+value as the text pandas would make of it. A missing value (null, NaN) never matches any text, whatever pandas
+version is installed (pandas 2 turned it into the text "None" or "nan"; show_table.ref_of, too, leaves a coordinate
+with a missing tbl_id, item_id or period NaN, as pandas 3 does). An integer column with a null anywhere in the file
+is float64 in pandas ("2023.0"), so that is looked up in the file footer. (The provided tables hold these columns
+as text; the number cases are there so that no file is read wrongly.)
+A coordinate is written as Phase 1 writes a cell's source_ref (ref_column; scripts/show_table.py explains it).
 Used by scripts/show_table.py and evals/check_items.py (which puts this folder on its path).
 """
 
@@ -156,14 +158,30 @@ class TableFile:
         return self.dataset.count_rows(filter=where)
 
 
+def named_rows(values) -> pa.Array:
+    """Whether each row has a name for a category (a dimN_name column's values): not missing and not empty."""
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+    if pa.types.is_dictionary(values.type):
+        values = values.dictionary_decode()
+    return pc.fill_null(pc.not_equal(values.cast(pa.string()), ""), False)
+
+
 def ref_column(tf: TableFile, batch: pa.RecordBatch) -> pa.Array:
-    """Each row's coordinate tbl_id|item_id|<code of each category the row has>|period, as pandas built it.
-    A missing code is skipped; a missing tbl_id, item_id or period makes the whole coordinate null."""
+    """Each row's coordinate tbl_id|item_id|<codes>|period, written as Phase 1 writes the cell's source_ref
+    (kosis_chat/prepare/convert.py cells_of): <codes> are the codes of the categories named on the row, in order,
+    joined by "|"; a named category without a code is an empty text, and a row without a named category has one
+    empty text (tbl_id|item_id||period). `batch` needs the dimN_name columns next to the dimN_code ones. A missing
+    tbl_id, item_id or period makes the whole coordinate null."""
     names = batch.schema.names
     ref = pc.binary_join_element_wise(tf.texts("tbl_id", batch["tbl_id"]), tf.texts("item_id", batch["item_id"]), "|")
+    named_any = pa.array(np.zeros(batch.num_rows, bool))
     for i in range(1, 9):
-        code = f"dim{i}_code"
-        if code in names:
-            part = pc.fill_null(pc.binary_join_element_wise("", tf.texts(code, batch[code]), "|"), "")
-            ref = pc.binary_join_element_wise(ref, part, "")
+        name, code = f"dim{i}_name", f"dim{i}_code"
+        if name in names and code in names:
+            named = named_rows(batch[name])
+            text = pc.binary_join_element_wise("", pc.fill_null(tf.texts(code, batch[code]), ""), "|")
+            ref = pc.binary_join_element_wise(ref, pc.if_else(named, text, ""), "")
+            named_any = pc.or_(named_any, named)
+    ref = pc.binary_join_element_wise(ref, pc.if_else(named_any, "", "|"), "")
     return pc.binary_join_element_wise(ref, tf.texts("period", batch["period"]), "|")

@@ -15,8 +15,11 @@ A formula uses names, numbers, + - * / ** and parentheses.
 The numbers are read from the tables here, never taken from the spec: a cell's value is the table's, a formula is
 computed exactly from value_raw and rounded. A spec is rejected (and reported with its reason) when:
 a coordinate is not exactly one row of the item's tables or is not a number ('ok') cell; a formula cannot be
-computed or its result lies on a rounding tie; a table of table_keys has no cell in the spec (the question does not
-need it); the question is already in --known files (the baseline and earlier golden files); a field is missing.
+computed or its result lies on a rounding tie; a formula's result stays the same when one of its + - * / is another
+of the four or the two sides of a - or / change places (with these values the item cannot tell the calculation the
+question asks for from another one: 2 + 2 and 2 * 2; ask about other cells); a table of table_keys has no cell in
+the spec (the question does not need it); the question is already in --known files (the baseline and earlier golden
+files); a field is missing.
 
 Output: --out, items in the baseline format (evals/BASELINE.md) and, next to it, <out>.report.json: per spec id
 "built" or the reason it was rejected. The built file is then checked with check_items.py. Nothing of the items is
@@ -26,6 +29,8 @@ printed except ids and reasons. Exit code 0 when at least one item was built and
 from __future__ import annotations
 
 import argparse
+import ast
+import copy
 import json
 import os
 import sys
@@ -52,6 +57,44 @@ def _formula(entry, where: str) -> dict:
     if not isinstance(digits, int) or isinstance(digits, bool) or not 0 <= digits <= 6:
         raise Rejected(f"{where} {entry['id']}: round is a whole number from 0 to 6")
     return {"id": entry["id"], "formula": entry["formula"], "round": digits}
+
+
+_FOUR = (ast.Add, ast.Sub, ast.Mult, ast.Div)
+_SIGN = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
+
+
+def other_calculations(formula: str):
+    """The formulas one step away from this one: one of its + - * / replaced by another of the four, or the two
+    sides of a - or / swapped. Yields (what changed, the formula)."""
+    tree = ast.parse(formula, mode="eval")
+    count = sum(1 for node in ast.walk(tree) if isinstance(node, ast.BinOp) and isinstance(node.op, _FOUR))
+    for at in range(count):
+        for new in (*_FOUR, None):
+            changed = copy.deepcopy(tree)
+            node = [n for n in ast.walk(changed) if isinstance(n, ast.BinOp) and isinstance(n.op, _FOUR)][at]
+            old = type(node.op)
+            if new is None:
+                if old in (ast.Add, ast.Mult):
+                    continue
+                node.left, node.right = node.right, node.left
+                yield f"the two sides of '{_SIGN[old]}' change places", ast.unparse(changed)
+            elif new is not old:
+                node.op = new()
+                yield f"'{_SIGN[old]}' is '{_SIGN[new]}'", ast.unparse(changed)
+
+
+def same_under_another(formula: str, values: dict[str, Decimal], answer: Decimal, digit: Decimal) -> str | None:
+    """What can be changed in the formula without the rounded result leaving the answer's tolerance (grade.py takes
+    a number within half of the last digit), or None. An item like that cannot show that the module did the
+    calculation the question asks for: with 2 and 2 a product passes for a sum."""
+    for what, other in other_calculations(formula):
+        try:
+            x = check_items.exact(other, values)
+        except (ValueError, ZeroDivisionError, InvalidOperation, SyntaxError, ArithmeticError):
+            continue
+        if abs(x - answer) <= digit / 2:
+            return what
+    return None
 
 
 def build(spec: dict, tables: dict[str, dict], shas: dict[str, str], known: set[str]) -> dict:
@@ -117,6 +160,10 @@ def build(spec: dict, tables: dict[str, dict], shas: dict[str, str], known: set[
         scaled = x / digit
         if abs(abs(scaled - scaled.to_integral_value(rounding=ROUND_HALF_EVEN)) - Decimal("0.5")) < check_items.TIE_MARGIN:
             raise Rejected(f"formula {name}: the result is on a rounding tie")
+        rounded = x.quantize(digit, rounding=ROUND_HALF_EVEN)
+        if (what := same_under_another(step["formula"], values, rounded, digit)) is not None:
+            raise Rejected(f"formula {name}: the result is the same when {what} (with these cells' values the item "
+                           f"cannot tell the calculation the question asks for from another one)")
         values[name] = x
         facts[name] = {"id": name, "value": float(x.quantize(digit, rounding=ROUND_HALF_EVEN)),
                        "derivation": step["formula"], "round": step["round"]}

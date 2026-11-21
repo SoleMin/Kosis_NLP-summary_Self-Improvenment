@@ -23,10 +23,21 @@ Rule (decided 2026-11-19, changed 2026-11-20):
   model_type 0.5 (the model also set the question type, the ranking axis or max/min; --weight-type),
   anything else 0 (the model wrote the plan or the numbers, or the origin is not recorded).
 - No plan (status no_plan), a refused calculation (refused), a run error or a missing output scores 0.
+- An item whose tables could not be read (status load_error, written by run_calc.py) scores 0 too, but it is not a
+  result of the code under test. It is counted on its own (category "load_error"); a summary that has any is not
+  a measurement of the code, and the loop does not use it.
 - A cell fact (source_ref) matches a module fact with the same source_ref and exactly the same value.
 - A derived fact (derivation + round) matches a module fact whose value is within half of the last rounded digit
-  (round 2 -> 0.005). One module fact can satisfy only one required fact.
+  (round 2 -> 0.005). On top of that only what a float cannot hold is allowed: four steps of the float grid at the
+  size of the two numbers (math.ulp), 1e-9 at least. It does not grow with the answer beyond that: for an answer
+  near 1e12 it is 0.0005, not 1000. One module fact can satisfy only one required fact.
 - aux_facts (the cells a derivation reads) earn nothing; choosing them costs nothing; their coverage is reported.
+- The same-inputs score (score_same_inputs) is the item score with one more condition on a derived fact: the module
+  fact must be computed from the same source cells as the item's derivation, both followed down to the cells. How
+  the module combined them is not compared (a rate from the two cells, or from their difference and one of them,
+  reads the same cells). A number that only happens to equal the answer, made from other cells, earns nothing
+  here. The loop keeps a fix only when this score rises too (GOAL.md); the plain score alone can be raised by such
+  a number.
 - Chart: when an item has chart_expected (true/false) and the output says whether a chart came back ("chart"),
   the two are compared. Reported separately; it enters the final number only with --chart-weight.
 - --legacy grades outputs of the whole pipeline the 2026-11-19 way: every fact counts, no weight, nothing is extra.
@@ -40,12 +51,14 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import statistics
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-REL_EPS = 1e-9  # float noise allowed on top of the half-digit tolerance
+ABS_EPS = 1e-9  # float noise allowed on top of the half-digit tolerance: this, or ULPS steps of the float grid
+ULPS = 4        # at the size of the numbers compared when that is more (a number near 1e12: 0.0005)
 WEIGHTS = {"rules": 1.0, "model_codes": 0.8, "model_type": 0.5}  # by the output's "origin"; any other origin: 0
 ZERO_STATUS = ("no_plan", "refused")  # the number path ended without numbers
 _BIN = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
@@ -112,7 +125,9 @@ def tolerance(fact: dict) -> float:
 
 
 def close(a: float, b: float, tol: float) -> bool:
-    return abs(a - b) <= tol + REL_EPS * max(1.0, abs(b))
+    """Within tol, give or take what floats of this size cannot tell apart. (Until 2026-11-21 the allowance was
+    1e-9 of the answer's size, which let 1e12 + 500 pass for 1e12.)"""
+    return abs(a - b) <= tol + max(ABS_EPS, ULPS * math.ulp(max(abs(a), abs(b))))
 
 
 def max_matching(candidates: list[list[int]]) -> dict[int, int]:
@@ -232,14 +247,18 @@ def grade_item(item: dict, out: dict | None, cell_mode: str = "ref", weights: di
     match, right, extra = score_with(cell_mode)
     kept = kept_of(match, extra)
     match_value_only, right_value_only, extra_value_only = score_with("value")
-    # strict: a matched derived fact must also be built from the same source cells as the gold derivation
-    same_inputs = {}
-    for r, m in match.items():
+    # strict: a derived fact is matched only by a module fact built from the same source cells as the item's own
+    # derivation (followed down to the cells on both sides). Matched again on its own, so that of two module facts
+    # with the answer's value the one built from the right cells is the one that counts.
+    def same_cells(r: int, m: int) -> bool:
         if required[r].get("source_ref"):
-            continue
-        gold_refs, mod_refs = leaf_refs(required[r]["id"], gold_by_id), leaf_refs(mods[m].get("id"), mod_by_id)
-        same_inputs[required[r]["id"]] = gold_refs is not None and gold_refs == mod_refs
-    strict = (len(match) - sum(1 for ok in same_inputs.values() if not ok)) / len(required) if required else 0.0
+            return True
+        gold_refs = leaf_refs(required[r]["id"], gold_by_id)
+        return gold_refs is not None and gold_refs == leaf_refs(mods[m].get("id"), mod_by_id)
+
+    strict_match = max_matching([[m for m in _candidates(required[r], mods, cell_mode) if same_cells(r, m)]
+                                 for r in range(len(required))])
+    strict = len(strict_match) / len(required) if required else 0.0
 
     missing = [required[r] for r in range(len(required)) if r not in match]
     near = {f["id"]: flags for f in missing if (flags := _near_miss(f, mods))}
@@ -248,7 +267,7 @@ def grade_item(item: dict, out: dict | None, cell_mode: str = "ref", weights: di
     expected_chart = item.get("chart_expected") if (legacy or "chart" in out) else None
     made_chart = bool(out.get("chart")) if status == "ok" else False
     full = bool(required) and len(match) == len(required)
-    if status in ZERO_STATUS:
+    if status in ZERO_STATUS or status == "load_error":
         category = status
     elif status != "ok":
         category = "error"
@@ -288,9 +307,9 @@ def _mean(xs) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-CATEGORIES = ("correct", "wrong", "not_accepted", "refused", "no_plan", "error")
+CATEGORIES = ("correct", "wrong", "not_accepted", "refused", "no_plan", "error", "load_error")
 _CATEGORY_KO = {"correct": "정답", "wrong": "숫자 틀림", "not_accepted": "모델이 계획·숫자를 정함(또는 출처 없음)",
-                "refused": "계산 거절", "no_plan": "계획 실패", "error": "오류"}
+                "refused": "계산 거절", "no_plan": "계획 실패", "error": "오류", "load_error": "표 읽기 실패"}
 _ORIGIN_KO = {"rules": "규칙만", "model_codes": "모델이 분류만 채움", "model_type": "모델이 유형까지 정함",
               "model_plan": "모델이 계획을 씀", "fallback": "모델이 숫자를 씀", "None": "기록 없음"}
 
@@ -361,6 +380,9 @@ def print_summary(s: dict) -> None:
     print(f"문항 {n}  점수 {s['score']:.4f}  (배점을 곱하기 전 {s['right_unweighted']:.4f} · "
           f"PASS {s['pass']} / PARTIAL {s['partial']} / FAIL {s['fail']})")
     print("결과: " + " · ".join(f"{_CATEGORY_KO[k]} {v}" for k, v in s["category"].items()))
+    if s["category"].get("load_error"):
+        print(f"주의: 표를 읽지 못한 문항이 {s['category']['load_error']}건 있음. 코드의 결과가 아니므로 이 점수는 "
+              f"측정값으로 쓸 수 없음 (같은 --out으로 다시 실행하면 그 문항만 다시 돎)")
     print("[계획을 만든 방식]")
     for name, g in s["origin"].items():
         print(f"  {_ORIGIN_KO.get(name, name):<22} {g['items']:>4}문항  배점 {g['weight']:.2f}  "

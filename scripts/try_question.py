@@ -7,8 +7,10 @@
 It calls kosis_chat.calc.calculate(question, tables) of the Phase 1 clone with no model and no key, which is how
 the loop measures, and prints what came back:
 
-    status: ok | no_plan | refused | error
+    status: ok | no_plan | refused | error | load_error
     reason / detail when there is no plan, the calculation was refused, or the code raised
+    load_error: a table could not be read (its file is missing or damaged, the memory ran out). That is not the
+    code answering wrongly and not an attack: the loop's measurement stops on it. Exit code 3.
     on "ok": the facts the answer uses (id = value unit, period, the cell's coordinate or the formula)
 
 Use it to see whether a question is already solved before writing it as an attack. A value printed here is the
@@ -28,6 +30,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_TABLES = 3
+
+
+def unread(exc: BaseException) -> int:
+    """A table could not be read: said apart from the code raising on the question (evals/run_calc.py does the same)."""
+    print("status: load_error")
+    print(f"detail: {type(exc).__name__}: {str(exc)[:500]}")
+    print("표를 읽지 못했습니다. 코드가 틀린 것이 아니므로 공격 문항으로 쓰지 않습니다. 같은 일이 되풀이되면 탐색 보고에 "
+          "명령과 오류를 적습니다.")
+    return 3
 
 
 def fact_line(fact) -> str:
@@ -81,8 +92,12 @@ def main(argv: list[str] | None = None) -> int:
     except LookupError as exc:
         print(f"{exc} (find a key with scripts/show_table.py --find)", file=sys.stderr)
         return 2
+    except Exception as exc:
+        return unread(exc)
     try:
         result = calc.calculate(args.question, tables)  # no llm=, no client=: the rules alone
+    except (OSError, MemoryError) as exc:  # a big table's cells are read from its file while it calculates
+        return unread(exc)
     except Exception as exc:  # a crash is a finding too: the loop's measurement counts it as an error
         print("status: error")
         print(f"detail: {type(exc).__name__}: {str(exc)[:500]}")
