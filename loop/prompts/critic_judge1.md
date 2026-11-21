@@ -1,0 +1,12 @@
+너는 KOSIS 개선 루프 {{LOOP_NUM}}번의 평가자다. 이전 대화는 없다. 지금 할 일은 "공격 문항 1차 판정" 하나다. 문항에는 아직 숫자가 없다.
+
+1. `AGENTS.md`, `GOAL.md`, `docs/CRITIC.md`("공격 데이터 판정"), `docs/ATTACKER.md`(제약과 문항 형식)를 읽는다.
+2. 공격자가 쓴 문항 `loop/attack/spec_{{LOOP_NUM}}.jsonl`을 한 건씩 판정한다. 질문이 주어진 표만으로 답할 수 있는지, 답이 하나로 정해지는지, 칸 좌표와 계산식이 질문이 묻는 것과 같은지, 공격자 문서의 제약을 지켰는지 본다. 칸 좌표는 `python scripts/show_table.py <표 키> --cell ...`로 확인할 수 있다.
+3. 판정을 `loop/attack/judge1_{{LOOP_NUM}}.jsonl`에 쓴다. 문항마다 한 줄이다. 모든 문항에 판정을 쓴다. 판정이 빠진 문항은 부적절로 세지 않고 그 문항만 다시 요청받는다. 문항 파일에 없는 id는 쓰지 않는다.
+
+```
+{"id": "L{{LOOP_NUM}}-001", "ok": true, "reason": ""}
+{"id": "L{{LOOP_NUM}}-002", "ok": false, "reason": "답이 둘로 읽힘: ..."}
+```
+
+`loop/attack/judge1_{{LOOP_NUM}}.jsonl` 하나만 쓴다. 공격자의 문항 파일, 코드, `evals/`는 고치지 않는다. git 명령은 쓰지 않는다.

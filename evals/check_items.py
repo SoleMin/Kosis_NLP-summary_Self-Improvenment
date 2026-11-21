@@ -1,4 +1,4 @@
-"""Check an item file against the tables it was made from. Phase 1 is not imported; pandas and pyarrow are needed.
+"""Check an item file against the tables it was made from. Phase 1 is not imported; pyarrow and pandas are needed.
 
     python evals/check_items.py --workspace <folder that holds data/>
 
@@ -10,6 +10,7 @@ For every item:
 - the grader gives the item's own facts a full score and an empty answer zero.
 
 Nothing of the items is printed except ids. Exit code 0 when every check passes.
+Only the rows of the items' cells are read from each table (see load_table), so big tables are fine.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(HERE.parent / "scripts"))  # tablescan.py, shared with scripts/show_table.py
 import grade  # noqa: E402
 
 getcontext().prec = 50
@@ -58,21 +60,109 @@ def exact(expr: str, values: dict[str, Decimal]) -> Decimal:
     return ev(ast.parse(expr, mode="eval"))
 
 
-def load_table(path: Path):
-    """source_ref -> list of (value, value_raw, value_kind) for one Parquet file."""
-    import pyarrow.parquet as pq
+def load_table(path: Path, refs=None):
+    """source_ref -> list of (value, value_raw, value_kind) for one Parquet file, as pandas reads them.
 
-    df = pq.read_table(path).to_pandas()
-    ref = df["tbl_id"].astype(str) + "|" + df["item_id"].astype(str)
-    for i in range(1, 9):
-        col = f"dim{i}_code"
-        if col in df:
-            ref = ref + df[col].map(lambda c: "" if c is None or c != c else "|" + str(c))
-    ref = ref + "|" + df["period"].astype(str)
+    With refs, only those coordinates are looked for, a row group at a time so memory stays small on any table:
+    row groups whose periods cannot match are skipped (footer statistics), the coordinate columns of the others are
+    read as dictionaries and narrowed to rows whose every part could be in a wanted coordinate, the exact coordinate
+    is built for those, and value columns are read only for rows that are wanted. Without refs, every row (slow on
+    big tables)."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from tablescan import TableFile, ref_column
+
+    tf = TableFile(path)
+    codes = [f"dim{i}_code" for i in range(1, 9) if f"dim{i}_code" in tf.schema.names]
+    wanted = parts = None
+    groups = tf.row_groups()
+    if refs is not None:
+        # a text that is not valid UTF-8 (a lone surrogate) is no row's coordinate, and arrow cannot hold it
+        wanted = pa.array(sorted({r for r in refs if isinstance(r, str) and utf8(r)}), pa.string())
+        parts = ref_parts(wanted.to_pylist())
+        # an OR of equalities: arrow does not use the statistics for an is_in of more than about 50 values; it is
+        # pruned a chunk of terms at a time, since one long OR overflows the C stack (thousands of refs)
+        groups = tf.row_groups_any([tf.equals("period", p) for p in sorted(parts["period"])])
     rows = defaultdict(list)
-    for r, v, raw, kind in zip(ref, df["value"], df["value_raw"], df["value_kind"]):
-        rows[r].append((v, raw, kind))
+    for group in groups:
+        keys = tf.read(group, ["tbl_id", "item_id", *codes, "period"])
+        at = pa.array(np.arange(keys.num_rows))
+        if parts is not None:
+            at = pa.array(may_match(keys, parts, codes, len(wanted)))
+            keys = keys.take(at)
+        ref = ref_column(tf, keys)
+        keep = pc.is_in(ref, value_set=wanted) if wanted is not None else pc.is_valid(ref)
+        if not pc.any(keep).as_py():
+            continue
+        df = tf.to_pandas(tf.read(group, ["value", "value_raw", "value_kind"]).take(at.filter(keep)))
+        for r, v, raw, kind in zip(ref.filter(keep).to_pylist(), df["value"], df["value_raw"], df["value_kind"]):
+            rows[r].append((v, raw, kind))
     return rows
+
+
+def ref_parts(refs: list[str]) -> dict[str, dict[str, int]]:
+    """For each column, text -> bit set (an int) of the refs whose coordinate could hold that text there. It does not
+    assume that no code holds a "|": tbl_id is some text before a "|", period some text after one, item_id and each
+    code some text between two."""
+    from itertools import combinations
+
+    parts = {"tbl_id": {}, "item_id": {}, "period": {}, "code": {}}
+    for n, ref in enumerate(refs):
+        cuts = [i for i, ch in enumerate(ref) if ch == "|"]
+        if len(cuts) < 2:  # a row's coordinate has at least tbl_id|item_id|period
+            continue
+        middles = {ref[i + 1:j] for i, j in combinations(cuts, 2)}
+        for name, texts in (("tbl_id", {ref[:i] for i in cuts}), ("period", {ref[i + 1:] for i in cuts}),
+                            ("item_id", middles), ("code", middles)):
+            for text in texts:
+                parts[name][text] = parts[name].get(text, 0) | 1 << n
+    return parts
+
+
+def may_match(keys, parts: dict[str, dict[str, int]], codes: list[str], n_refs: int):
+    """Positions of the rows that could have one of the refs' coordinates: for some ref, every text column holds a
+    text that ref allows (a missing code is allowed: it is left out of the coordinate). Worked out with bit sets
+    (64 refs at a time) on each column's dictionary, period first and then only on the rows still left, so it is
+    cheap and few rows are left for the exact check. Other column types are left to that check."""
+    import numpy as np
+    import pyarrow as pa
+
+    columns = []
+    for name in sorted(keys.column_names, key=lambda c: c != "period"):
+        col = keys[name].combine_chunks()
+        if pa.types.is_dictionary(col.type) and pa.types.is_string(col.type.value_type):
+            texts = col.dictionary.to_pylist()
+            index = col.indices.fill_null(len(texts)).to_numpy()  # the last entry stands for a missing value
+            columns.append((parts["code" if name in codes else name], texts, index, name in codes))
+    found = [np.arange(keys.num_rows)[:0]]
+    for word in range(0, max(n_refs, 1), 64):
+        rows, alive = np.arange(keys.num_rows), None
+        for allowed, texts, index, may_miss in columns:
+            bits = np.array([(allowed.get(t, 0) >> word) & (2**64 - 1) for t in texts] + [2**64 - 1 if may_miss else 0],
+                            np.uint64)
+            mine = bits[index[rows]]
+            alive = mine if alive is None else alive & mine
+            left = alive != 0
+            rows, alive = rows[left], alive[left]
+        found.append(rows)
+    return np.unique(np.concatenate(found))  # in file order
+
+
+def utf8(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:  # in pieces: a table file can be large
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         if n > 1:
             problems.append(f"a question is used {n} times")
 
+    wanted = defaultdict(set)  # table key -> every source_ref an item of that table looks up
+    for item in items:
+        refs = {f["source_ref"] for f in item["required_facts"] + item["aux_facts"] if f.get("source_ref")}
+        for key in item["table_keys"]:
+            wanted[key] |= refs
+
     for item in items:
         iid = item["id"]
         for key, digest in zip(item["table_keys"], item["tables_sha256"]):
@@ -108,9 +204,9 @@ def main(argv: list[str] | None = None) -> int:
                 problems.append(f"{iid}: table file missing: {key}")
                 tables[key] = {}
                 continue
-            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            if sha256(path) != digest:
                 changed_tables.add(key)
-            tables[key] = load_table(path)
+            tables[key] = load_table(path, wanted[key])
         pool = defaultdict(list)
         for key in item["table_keys"]:
             for ref, rows in tables[key].items():

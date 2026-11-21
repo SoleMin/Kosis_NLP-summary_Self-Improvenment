@@ -1,0 +1,32 @@
+# 방어자가 고칠 수 있는 파일 (Phase 1 클론 기준 경로). scripts/loop_main.py가 방어자 실행 뒤 검사함.
+# 한 줄에 패턴 하나. 앞에 !가 있으면 금지. 한 파일에 여러 줄이 맞으면 마지막 줄이 정함.
+# *는 폴더 안, **는 하위 폴더까지. {N}은 현재 루프 번호.
+
+# 질문 해석, 분류 고르기, 기본값
+kosis_chat/judge/question.py
+kosis_chat/judge/rules.py
+kosis_chat/judge/schemas.py
+
+# 규칙 계획, 분류 매핑, 다중 표 규칙
+kosis_chat/analyze/**
+!kosis_chat/analyze/write.py
+!kosis_chat/analyze/multi.py
+!kosis_chat/analyze/event_lookup.py
+# 프롬프트는 고치지 않음 (2026-11-21: 루프의 측정이 모델을 부르지 않아 효과를 확인할 수 없음)
+!kosis_chat/analyze/prompts/**
+!kosis_chat/analyze/prompts.py
+
+# 계산, 답에 쓸 값 고르기
+kosis_chat/compute/**
+
+# 새 연산과 계획 단계 (공용 형식 파일). 연산 계획 부분에 더하는 것만 가능하고, fact·결과·답 형식은 그대로여야 함.
+# scripts/contract_check.py가 커밋된 내용과 비교해 검사함.
+src/kosis_ai/schemas.py
+
+# 공용 표현 사전, 표 색인. 여기를 고치면 큰 표의 저장된 색인을 표마다 한 번씩 다시 만듦.
+# 칸 창구(kosis_chat/prepare/store.py)와 파일에서 읽는 코드(kosis_chat/adapters/**)는 목록에 없음: 고칠 수 없음.
+kosis_chat/shared/**
+kosis_chat/prepare/index.py
+
+# 방어자가 추가하는 테스트
+tests/loop/**

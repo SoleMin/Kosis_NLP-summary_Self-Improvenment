@@ -26,7 +26,6 @@ printed except ids and reasons. Exit code 0 when at least one item was built and
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -169,14 +168,21 @@ def main(argv: list[str] | None = None) -> int:
             specs.append(spec)
         except ValueError:
             report[f"line {n}"] = "not a JSON object"
+    wanted = defaultdict(set)  # table key -> every coordinate a spec of that table names
+    for spec in specs:
+        cells = spec.get("cells")
+        refs = {v for v in cells.values() if isinstance(v, str)} if isinstance(cells, dict) else set()
+        for key in spec.get("table_keys") or []:
+            if isinstance(key, str):
+                wanted[key] |= refs
     tables: dict[str, dict] = {}
     shas: dict[str, str] = {}
     for spec in specs:
         for key in spec.get("table_keys") or []:
             path = values_dir / f"{key}.parquet" if isinstance(key, str) else None
             if key not in tables and path is not None and path.is_file():
-                tables[key] = check_items.load_table(path)
-                shas[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+                tables[key] = check_items.load_table(path, wanted[key])  # only the rows the specs name
+                shas[key] = check_items.sha256(path)
 
     items = []
     seen_ids: set[str] = set()

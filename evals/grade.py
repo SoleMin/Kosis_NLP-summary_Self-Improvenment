@@ -7,11 +7,18 @@
 Rule (decided 2026-11-19, changed 2026-11-20):
 - What is graded is the number path alone: defaults -> the rules' plan -> (the model fills categories the rules left
   open) -> compute. The judge's refusals and the sentence are not part of it.
-- The module's answer is the facts it marks as the answer (the output's "main": Computed.main, the facts of
-  plan.show). Other facts it computed are not graded.
+- The module's answer is the facts it chose for the answer (the output's "answer": the ids
+  compute.answer_facts.step_answer_facts returned; an output written before that step has "main", the facts of
+  plan.show, and that is read instead). Other facts it computed are not graded.
 - An item's answer is its required_facts. Right = matched required facts / required facts.
   All matched = PASS, some = PARTIAL, none = FAIL.
-- Item score = right x the weight of how the plan was made (the output's "origin"):
+- A chosen fact has to belong to the answer (decided 2026-11-20: "the answer and the cells it is computed from").
+  It belongs when it matched a required fact, when it is one of the item's aux_facts (the cells the answer is
+  computed from), or when a chosen fact that matched a required fact was computed from it (the module's own
+  derivations, followed down). Any other chosen fact is extra. A wrong answer is already paid for as a required
+  fact that was not matched, so extras are counted beyond the number of unmatched required facts:
+  kept = 1 - max(0, extra - unmatched required) / chosen facts.
+- Item score = right x kept x the weight of how the plan was made (the output's "origin"):
   rules 1.0 (rules alone), model_codes 0.8 (the model filled category codes only; --weight-codes),
   model_type 0.5 (the model also set the question type, the ranking axis or max/min; --weight-type),
   anything else 0 (the model wrote the plan or the numbers, or the origin is not recorded).
@@ -19,10 +26,10 @@ Rule (decided 2026-11-19, changed 2026-11-20):
 - A cell fact (source_ref) matches a module fact with the same source_ref and exactly the same value.
 - A derived fact (derivation + round) matches a module fact whose value is within half of the last rounded digit
   (round 2 -> 0.005). One module fact can satisfy only one required fact.
-- aux_facts (the cells a derivation reads) are never scored; their coverage is reported only.
+- aux_facts (the cells a derivation reads) earn nothing; choosing them costs nothing; their coverage is reported.
 - Chart: when an item has chart_expected (true/false) and the output says whether a chart came back ("chart"),
   the two are compared. Reported separately; it enters the final number only with --chart-weight.
-- --legacy grades outputs of the whole pipeline the 2026-11-19 way: every fact counts, no weight.
+- --legacy grades outputs of the whole pipeline the 2026-11-19 way: every fact counts, no weight, nothing is extra.
 
 The last stdout line is one number in 0..1 (evals/README.md). Per-item details go to <run>/graded.jsonl and are
 never printed: they contain the questions and answers.
@@ -144,6 +151,37 @@ def _candidates(req: dict, mods: list[dict], cell_mode: str) -> list[int]:
     return out
 
 
+def _inputs_of(ids: list[str], by_id: dict[str, dict]) -> set[str]:
+    """Ids of every fact the given facts were computed from, followed down their derivations (the given ids too)."""
+    seen: set[str] = set()
+    todo = list(ids)
+    while todo:
+        i = todo.pop()
+        if i in seen or i not in by_id:
+            continue
+        seen.add(i)
+        todo += names(by_id[i].get("derivation") or "")
+    return seen
+
+
+def _extra(mods: list[dict], matched: list[int], aux: list[dict], by_id: dict[str, dict], cell_mode: str) -> list[int]:
+    """Indexes of the chosen facts that do not belong to the answer: not matched to a required fact, not a cell the
+    item's answer is computed from (aux_facts), and nothing a matched fact was computed from."""
+    used = _inputs_of([mods[m].get("id") for m in matched], by_id)
+    aux_refs = {(f["source_ref"], float(f["value"])) for f in aux if f.get("source_ref") and is_num(f.get("value"))}
+    aux_values = {v for _, v in aux_refs}
+    out = []
+    for i, m in enumerate(mods):
+        if i in matched or m.get("id") in used:
+            continue
+        v = m.get("value")
+        if is_num(v) and m.get("source_ref") and not m.get("derivation"):
+            if (m["source_ref"], float(v)) in aux_refs or (cell_mode == "value" and float(v) in aux_values):
+                continue
+        out.append(i)
+    return out
+
+
 def _near_miss(req: dict, mods: list[dict]) -> list[str]:
     """Why an unmatched required fact may have been close (diagnosis only, never scored)."""
     g, flags = float(req["value"]), []
@@ -172,21 +210,28 @@ def grade_item(item: dict, out: dict | None, cell_mode: str = "ref", weights: di
     status = "missing" if not out else out.get("status", "ok")
     every = (out.get("facts") or []) if status == "ok" else []
     mod_by_id = {m.get("id"): m for m in every}
-    marked = isinstance(out.get("main"), list)
+    chosen = out.get("answer") if isinstance(out.get("answer"), list) else out.get("main")
+    marked = isinstance(chosen, list)
     if legacy:
         mods, factor, origin = every, 1.0, out.get("origin")
-    else:  # only what the module marks as the answer; an output without the mark has no answer
-        main = set(out["main"]) if marked else set()
-        mods = [m for m in every if m.get("id") in main]
+    else:  # only the facts the module chose for the answer; an output without the list has no answer
+        ids = set(chosen) if marked else set()
+        mods = [m for m in every if m.get("id") in ids]
         origin = out.get("origin")
         factor = float((WEIGHTS if weights is None else weights).get(origin, 0.0)) if status == "ok" else 0.0
 
-    def score_with(mode: str) -> tuple[dict[int, int], float]:
+    def score_with(mode: str) -> tuple[dict[int, int], float, list[int]]:
         match = max_matching([_candidates(r, mods, mode) for r in required])
-        return match, (len(match) / len(required) if required else 0.0)
+        extra = [] if legacy else _extra(mods, list(match.values()), aux, mod_by_id, mode)
+        return match, (len(match) / len(required) if required else 0.0), extra
 
-    match, right = score_with(cell_mode)
-    _, right_value_only = score_with("value")
+    def kept_of(match: dict[int, int], extra: list[int]) -> float:
+        counted = max(0, len(extra) - (len(required) - len(match)))  # a wrong answer is not charged twice
+        return 1.0 - counted / len(mods) if mods else 1.0
+
+    match, right, extra = score_with(cell_mode)
+    kept = kept_of(match, extra)
+    match_value_only, right_value_only, extra_value_only = score_with("value")
     # strict: a matched derived fact must also be built from the same source cells as the gold derivation
     same_inputs = {}
     for r, m in match.items():
@@ -217,13 +262,18 @@ def grade_item(item: dict, out: dict | None, cell_mode: str = "ref", weights: di
         "tables": len(item.get("table_keys") or [1]),
         "status": status, "outcome": out.get("outcome"), "numbers_origin": out.get("numbers_origin"),
         "origin": origin, "weight": factor, "category": category, "reason": out.get("reason"),
-        "right": round(right, 6), "score": round(right * factor, 6),
+        "right": round(right, 6), "kept": round(kept, 6), "score": round(right * kept * factor, 6),
+        "score_no_extra_rule": round(right * factor, 6),
+        "extra_facts": len(extra), "extra_counted": max(0, len(extra) - (len(required) - len(match))),
+        "extra_ids": [mods[i].get("id") for i in extra],
         "verdict": "PASS" if full else "PARTIAL" if match else "FAIL",
         "required": len(required), "matched": sorted(required[r]["id"] for r in match),
         "missing": [f["id"] for f in missing], "near_miss": near,
-        "score_value_only": round(right_value_only * factor, 6), "score_same_inputs": round(strict * factor, 6),
+        "score_value_only": round(right_value_only * kept_of(match_value_only, extra_value_only) * factor, 6),
+        "score_same_inputs": round(strict * kept * factor, 6),
         "aux_cells": len(aux_cells), "aux_cells_found": sum(1 for f in aux_cells if f["source_ref"] in mod_refs_all),
         "module_facts": len(every), "main_facts": len(mods), "main_marked": marked or legacy,
+        "answer_step": isinstance(out.get("answer"), list),
         "llm_calls": out.get("llm_calls"),
         "chart_expected": expected_chart, "chart_made": made_chart,
         "chart_ok": None if expected_chart is None else (bool(expected_chart) == made_chart),
@@ -258,6 +308,7 @@ def summarize(rows: list[dict], chart_weight: float = 0.0) -> dict:
     final = fact_score if chart_acc is None else (1 - chart_weight) * fact_score + chart_weight * chart_acc
     ok = [r for r in rows if r["status"] == "ok"]
     counts = [r["module_facts"] for r in ok]
+    cut = [r for r in ok if r["extra_counted"]]
     mains = [r["main_facts"] for r in ok]
     by_origin: dict[str, list[dict]] = defaultdict(list)
     for r in ok:
@@ -271,7 +322,13 @@ def summarize(rows: list[dict], chart_weight: float = 0.0) -> dict:
                           "pass": sum(1 for r in rs if r["verdict"] == "PASS")}
                    for name, rs in sorted(by_origin.items())},
         "reason": dict(Counter(str(r["reason"]) for r in rows if r["category"] in ZERO_STATUS).most_common(15)),
+        "score_no_extra_rule": round(_mean(r["score_no_extra_rule"] for r in rows), 4),
+        "extra": {"items": len(cut), "facts": sum(r["extra_counted"] for r in cut),
+                  "kept_mean": round(_mean(r["kept"] for r in ok), 4) if ok else None,
+                  "right_but_cut": sum(1 for r in cut if r["verdict"] == "PASS"),
+                  "by_subtype": dict(Counter(str(r["subtype"]) for r in cut).most_common())},
         "main_not_marked": sum(1 for r in ok if not r["main_marked"]),
+        "without_answer_step": sum(1 for r in ok if r["main_marked"] and not r["answer_step"]),
         "main_facts_median": statistics.median(mains) if mains else None,
         "main_facts_max": max(mains) if mains else None,
         "llm_calls": sum(r["llm_calls"] or 0 for r in rows),
@@ -310,10 +367,19 @@ def print_summary(s: dict) -> None:
               f"맞은 비율 {g['right']:.4f}  PASS {g['pass']}")
     if s["reason"]:
         print(f"계획 실패·계산 거절 이유 {s['reason']}")
-    print(f"모델 호출 {s['llm_calls']}번 ({s['items_with_llm_call']}문항)  ·  답으로 표시한 fact 수 중앙값 "
+    print(f"모델 호출 {s['llm_calls']}번 ({s['items_with_llm_call']}문항)  ·  답에 쓴 fact 수 중앙값 "
           f"{s['main_facts_median']} 최대 {s['main_facts_max']}")
+    e = s["extra"]
+    if e["items"]:
+        print(f"답과 관계없는 값으로 감점된 문항 {e['items']}건 (값 {e['facts']}개, 그중 정답은 다 맞힌 문항 "
+              f"{e['right_but_cut']}건)  ·  감점이 없다면 점수 {s['score_no_extra_rule']:.4f}")
+        print(f"  세부 유형별 감점 문항 수 {e['by_subtype']}")
+    else:
+        print("답과 관계없는 값으로 감점된 문항 없음")
     if s["main_not_marked"]:
-        print(f"주의: 답 표시(main)가 없는 출력 {s['main_not_marked']}건")
+        print(f"주의: 답에 쓴 fact 목록(answer)이 없는 출력 {s['main_not_marked']}건")
+    if s["without_answer_step"]:
+        print(f"주의: 답 추리기 단계 전의 출력(answer 없이 main으로 채점) {s['without_answer_step']}건")
     if s["outcome"] or s["numbers_origin"]:
         print(f"실행 상태 {s['status']}  답변 종류 {s['outcome']}  숫자 출처 {s['numbers_origin']}")
     if s["scored_but_not_answered"]:

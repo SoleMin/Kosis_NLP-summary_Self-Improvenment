@@ -9,8 +9,14 @@ Each item is answered with kosis_chat.calc.calculate(question, tables, llm=...) 
 compute. The judge's rules, the model-written plan, the sentence and the chart are not run. The tables are read from
 <workspace>/data (--workspace, else the KOSIS_WORKSPACE environment variable).
 
+A table of 500,000 rows or more is not loaded whole: Phase 1 reads the cells it needs from the file (the clone's
+adapters.parquet.BIG_TABLE_ROWS). --big-rows N sets that number for this run: --big-rows 1 sends every table that
+can be read from its file that way (a check that both ways give the same results; compare the two runs with
+compare_runs.py). The first time, a table's file is scanned once and the scan is saved in <workspace>/data/index.
+
 --backend rules: an item the rules cannot place ends as "no_plan". --backend hcx: the fill step may call the model
-(at most twice per item). Replies that passed the format check are kept in --cache (default evals/cache/fill.jsonl)
+(at most twice per item; --model names it, --thinking sets its thinking effort, off by default). Replies that
+passed the format check are kept in --cache (default evals/cache/fill.jsonl)
 under a hash of the model name and the prompt, and reused: the same code and prompt give the same score, and only
 prompts that changed are asked again. --no-cache asks every time.
 
@@ -41,12 +47,25 @@ DEFAULT_ITEMS = HERE / "baseline" / "items.jsonl"
 DEFAULT_PHASE1 = HERE.parent / "kosis-ai-nlp-summary-T1-30"
 DEFAULT_CACHE = HERE / "cache" / "fill.jsonl"
 TABLES_KEPT = 48  # prepared tables kept in memory (items are run table by table)
+CELLS_KEPT = 1_000_000  # ... and at most this many cells in them (about 1.4 GB); the table in use is always kept
+FILE_TABLE_CELLS = 250_000  # what a table read from its file counts as (it holds its index, not its cells)
 
 
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def cells_held(resources) -> int:
+    """How much a prepared table counts toward CELLS_KEPT: its cells, or FILE_TABLE_CELLS when it is read from the file."""
+    table = getattr(resources, "table", None)
+    if getattr(table, "file_backed", False):
+        return FILE_TABLE_CELLS
+    try:
+        return len(table.cells)
+    except Exception:
+        return 0
 
 
 def git_head(repo: Path) -> str | None:
@@ -124,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--backend", choices=("rules", "hcx"), default="rules",
                    help="rules: no model call; hcx: the model fills what the rules leave open")
     p.add_argument("--model", default=None, help="HCX model; default: Phase 1's DEFAULT_MODEL")
+    p.add_argument("--thinking", choices=("none", "low", "medium", "high"), default="none",
+                   help="the model's thinking effort (HCX-007 only); default none")
+    p.add_argument("--max-tokens", type=int, default=0,
+                   help="output token limit; default 1024, or 5120 with --thinking (thinking tokens count)")
     p.add_argument("--phase1", type=Path, default=DEFAULT_PHASE1, help="the Phase 1 clone to run")
     p.add_argument("--workspace", type=Path, default=None, help="folder that holds data/ (else KOSIS_WORKSPACE)")
     p.add_argument("--out", type=Path, default=None, help="run folder; an existing one is continued")
@@ -140,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-env-file", action="store_true", help="read no .env file: the shell's variable only")
     p.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="file of the model's validated replies")
     p.add_argument("--no-cache", action="store_true", help="ask the model every time")
+    p.add_argument("--big-rows", type=int, default=None,
+                   help="rows from which a table is read from its file, not loaded whole (default: Phase 1's own)")
     args = p.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -169,6 +194,13 @@ def main(argv: list[str] | None = None) -> int:
         if phase1 not in Path(module.__file__).resolve().parents:
             print(f"{module.__name__} was imported from {module.__file__}, not from {phase1}", file=sys.stderr)
             return 2
+    from kosis_chat.adapters import parquet
+    if args.big_rows is not None:
+        if args.big_rows < 1 or not hasattr(parquet, "BIG_TABLE_ROWS"):
+            print("--big-rows needs a number of 1 or more and a Phase 1 clone that reads big tables from the file",
+                  file=sys.stderr)
+            return 2
+        parquet.BIG_TABLE_ROWS = args.big_rows
 
     model = args.model or DEFAULT_MODEL
     config = client = None
@@ -180,8 +212,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{args.key_env} is not set: not in the shell environment" +
                   ("" if env_file is None else f" and not in {env_file}"), file=sys.stderr)
             return 2
-        config = LLMConfig(api_key=key, model=model, provider="hcx")  # the settings object Phase 1 is given
-        client = cached_client(build_client(config), model, None if args.no_cache else args.cache)
+        max_tokens = args.max_tokens or (1024 if args.thinking == "none" else 5120)
+        config = LLMConfig(api_key=key, model=model, provider="hcx", thinking_effort=args.thinking,
+                           max_tokens=max_tokens)  # the settings object Phase 1 is given
+        # a reply is the model's under its settings: the cache keeps them apart (plain model name = thinking off)
+        label = model if args.thinking == "none" else f"{model}|thinking={args.thinking}"
+        client = cached_client(build_client(config), label, None if args.no_cache else args.cache)
 
     items = load_jsonl(args.items)
     only = {x.strip() for x in args.only.split(",") if x.strip()}
@@ -205,19 +241,24 @@ def main(argv: list[str] | None = None) -> int:
     done = {o["id"] for o in load_jsonl(outputs) if o.get("status") != "error" or not args.retry_errors}
     meta = {"path": "calc", "items": str(args.items.resolve()),
             "items_sha256": hashlib.sha256(args.items.read_bytes()).hexdigest(), "backend": args.backend, "split": args.split,
-            "model": model if args.backend == "hcx" else None, "fill_prompt": fill.VERSION, "phase1": str(phase1),
+            "model": model if args.backend == "hcx" else None,
+            "thinking": args.thinking if args.backend == "hcx" else None, "fill_prompt": fill.VERSION,
+            "phase1": str(phase1),
             "phase1_head": git_head(phase1), "workspace": workspace,
+            "big_rows": getattr(parquet, "BIG_TABLE_ROWS", None),
             "cache": None if (args.no_cache or args.backend != "hcx") else str(args.cache),
             "started": datetime.now().isoformat(timespec="seconds")}
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     tables: OrderedDict[str, object] = OrderedDict()
+    cells: dict[str, int] = {}
 
     def prepared(key: str):
         if key not in tables:
             tables[key] = calc.load_tables([key])[0]
-            if len(tables) > TABLES_KEPT:
-                tables.popitem(last=False)
+            cells[key] = cells_held(tables[key])
+            while len(tables) > 1 and (len(tables) > TABLES_KEPT or sum(cells.values()) > CELLS_KEPT):
+                cells.pop(tables.popitem(last=False)[0])
         tables.move_to_end(key)
         return tables[key]
 

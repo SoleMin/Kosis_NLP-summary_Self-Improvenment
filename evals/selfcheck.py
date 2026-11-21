@@ -29,10 +29,12 @@ CELLS = {"id": "T2", "type": "value", "subtype": "demo", "table_keys": ["000_T",
          "required_facts": [cell("a", "T|I|00|2020", 200), cell("b", "U|I|00|2020", 200)], "aux_facts": []}
 
 
-def out(facts, chart=False, status="ok", origin="rules", main=None):
-    """A number-path output; every fact is marked as the answer unless main says otherwise."""
-    return {"id": "x", "status": status, "origin": origin, "facts": facts, "chart": chart,
+def out(facts, chart=False, status="ok", origin="rules", main=None, answer=None):
+    """A number-path output; every fact is marked as the answer unless main (an output from before the answer step)
+    or answer (the ids the answer step chose) says otherwise."""
+    made = {"id": "x", "status": status, "origin": origin, "facts": facts, "chart": chart,
             "main": [f["id"] for f in facts] if main is None else main}
+    return made if answer is None else {**made, "answer": answer}
 
 
 def check(name, got, want):
@@ -99,6 +101,39 @@ def main() -> int:
               g(ITEM, {"id": "x", "status": "ok", "outcome": "answered", "facts": both}, legacy=True)["score"], 1.0),
         check("no chart key -> chart is not compared", g(ITEM, {k: v for k, v in out(both).items() if k != "chart"})["chart_ok"], None),
     ]
+    other = cell("f7", "T|I|99|2021", 999)  # a cell the answer is not computed from
+    share = {"id": "T3", "type": "share", "subtype": "demo", "table_keys": ["000_T"],  # change of a share, in %p
+             "required_facts": [derived("c", 10.0, "b / t2 * 100 - a / t1 * 100")],
+             "aux_facts": [cell("a", "T|I|01|2020", 20), cell("t1", "T|I|00|2020", 100),
+                           cell("b", "T|I|01|2021", 60), cell("t2", "T|I|00|2021", 200)]}
+    shares = [cell("f1", "T|I|01|2020", 20), cell("f2", "T|I|00|2020", 100), cell("f3", "T|I|01|2021", 60),
+              cell("f4", "T|I|00|2021", 200), derived("f5", 20.0, "f1 / f2 * 100"), derived("f6", 30.0, "f3 / f4 * 100"),
+              derived("f7", 10.0, "f6 - f5"), derived("f8", 3.0, "f3 / f1")]
+    winner = {"id": "T4", "type": "extreme", "subtype": "demo", "table_keys": ["000_T"],
+              "required_facts": [cell("w", "T|I|03|2021", 90)], "aux_facts": []}
+    ranked = [cell("f1", "T|I|03|2021", 90), cell("f2", "T|I|04|2021", 80), cell("f3", "T|I|05|2021", 70)]
+    results += [
+        check("answer list wins over main", g(ITEM, out(both, main=["f3"], answer=["f3", "f4"]))["score"], 1.0),
+        check("answer list: only what it names is graded", g(ITEM, out(both, answer=["f4"]))["score"], 0.5),
+        check("cells the answer is computed from cost nothing", g(ITEM, out(both))["kept"], 1.0),
+        check("an unrelated cell beside the right answers: 1 of 5 extra -> 0.8",
+              g(ITEM, out(both + [other]))["score"], 0.8),
+        check("... and the score without the rule is reported", g(ITEM, out(both + [other]))["score_no_extra_rule"], 1.0),
+        check("the weight still applies after the cut", g(ITEM, out(both + [other], origin="model_type"))["score"], 0.4),
+        check("what the matched answer was computed from costs nothing (the two shares of a change)",
+              g(share, out(shares, answer=["f5", "f6", "f7"]))["score"], 1.0),
+        check("a number nothing asked for, made from the same cells, is extra (1 of 4)",
+              g(share, out(shares, answer=["f5", "f6", "f7", "f8"]))["score"], 0.75),
+        check("every candidate beside the winner: 2 of 3 extra", g(winner, out(ranked))["score"], round(1 / 3, 6)),
+        check("the winner alone", g(winner, out(ranked, answer=["f1"]))["score"], 1.0),
+        check("a wrong answer is not charged twice (one of two wrong -> 0.5)",
+              (lambda r: (r["extra_facts"], r["extra_counted"], r["score"]))(
+                  g(ITEM, out([derived("f3", 50, "f2 - f1"), derived("f4", 25.006, "f2 / f1")]))), (1, 0, 0.5)),
+        check("an empty answer list -> 0", g(ITEM, out(both, answer=[]))["score"], 0.0),
+        check("value mode: a calc cell under another ref is not extra",
+              g(ITEM, out(both[2:] + [cell("f9", "Z|I|00|2020", 200)]), "value")["kept"], 1.0),
+        check("legacy: nothing is extra", g(winner, {"id": "x", "status": "ok", "facts": ranked}, legacy=True)["score"], 1.0),
+    ]
     rows = [g(ITEM, out(module_cells + [derived("f3", 50, "f2 - f1")], True)), g(CELLS, None),
             g(ITEM, out(both, True, origin="model_codes")), g(ITEM, {"id": "x", "status": "no_plan", "reason": "unresolved"})]
     summary = grade.summarize(rows)
@@ -107,6 +142,10 @@ def main() -> int:
     results.append(check("summary categories", summary["category"], {"correct": 1, "wrong": 1, "no_plan": 1, "error": 1}))
     results.append(check("summary origins", {k: v["items"] for k, v in summary["origin"].items()}, {"model_codes": 1, "rules": 1}))
     results.append(check("summary chart accuracy", summary["chart"]["accuracy"], 1.0))
+    cut = grade.summarize([g(ITEM, out(both + [other])), g(winner, out(ranked)), g(ITEM, out(both))])
+    results.append(check("summary: items cut for extra facts", (cut["extra"]["items"], cut["extra"]["facts"],
+                                                               cut["extra"]["right_but_cut"]), (2, 3, 2)))
+    results.append(check("summary: score without the rule", cut["score_no_extra_rule"], 1.0))
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
