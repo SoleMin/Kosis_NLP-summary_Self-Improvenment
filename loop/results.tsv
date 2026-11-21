@@ -1,1 +1,2 @@
-iter	time	task	verify	score	best	kept	commit
+loop	time	items	dev_before	dev_after	attack_before	attack_after	past_before	past_after	verify	kept	reason	commit	dev_strict_before	dev_strict_after	attack_strict_before	attack_strict_after	past_strict_before	past_strict_after
+1	2026-11-21 19:37	19	0.1516	0.3144	0.0000	0.2895	-	-	pass	1	약점 설명의 A(표 2~3개 규칙 계획 없음), B-1(항목 이름 속 조사), B-5·C-1(합계 표현과 합계 계획), D(비교의 답에 쓸 값)를 원인 단계에서 고쳤고, 새 조건은 특정 문항·표·분류가 아니라 표현 부류와 표의 항목 이름에서 만든 규칙이다. 평가자가 다른 표현·지역·기간·표 순서·실제 표 조합으로 변형 질문 20여 개를 규칙만으로 돌려 같은	25b999a	0.1502	0.3130	0.0000	0.2895	-	-
