@@ -9,4 +9,7 @@ source <(tr -d '\r' < loop/config.env)   # CRLF line endings would end up in the
 set +a
 if command -v cygpath >/dev/null 2>&1; then LOOP_BASH="$(cygpath -w "$BASH")"; else LOOP_BASH="$BASH"; fi
 export LOOP_BASH PYTHONUTF8=1
-exec "${PYTHON:-python}" scripts/loop_main.py --verify
+# The Python of the conda environment (CONDA_ENV, default kosis), first on PATH for the agents too.
+source scripts/use_python.sh
+use_python || { echo "시작할 수 없음" >&2; exit 1; }
+exec "$PYTHON" scripts/loop_main.py --verify

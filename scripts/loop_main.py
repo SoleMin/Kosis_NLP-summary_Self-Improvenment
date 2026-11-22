@@ -94,10 +94,14 @@ STORE_TESTS = ("tests/test_store.py", "tests/test_store_callers.py", "tests/test
 
 # An agent run that ended without its output and with these words at the end of its log has hit a limit of the
 # account it runs on (a subscription's usage window, a rate limit), whatever its exit code was.
+PLACEHOLDER = re.compile(r"<[^<>\s][^<>]*>")  # "<모델 이름>", "<해시>": a value of the example still to be filled in
 LIMIT = re.compile(r"(?i)usage limit|rate limit|limit reached|hit your [a-z ]*limit|quota|too many requests|overloaded")
 LOG_TAIL = 4000  # bytes of the log's end searched for LIMIT
 TIMED_OUT = -1  # the exit code recorded for a run stopped at AGENT_TIMEOUT
 RETRY_QUICK = 600  # seconds: a second or later try that worked longer than this and failed again is not retried
+FAIL_FAST = 30  # seconds: a failure this quick without the words of a limit is a setting (a wrong command or model name)
+FAIL_FAST_WAIT = 60  # seconds before such a failure runs again (a dropped connection may also end quickly)
+FAIL_FAST_MAX = 3  # quick failures in a row that end the run as a setting fault
 
 
 # The critic's record files. The critic writes them as drafts (loop/attack/records_N/<name>, where the defender
@@ -363,6 +367,12 @@ def file_digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
+def last_line(path: Path, most: int = 200) -> str:
+    """The last line of a log that is not empty, cut to `most` letters ('-' when there is none)."""
+    lines = [line.strip() for line in tail_of(path, 4000).splitlines() if line.strip()]
+    return (lines[-1][:most] if lines else "-").replace("\t", " ")
+
+
 def tail_of(path: Path, size: int = LOG_TAIL) -> str:
     """The end of a log as text ('' when it cannot be read)."""
     try:
@@ -626,7 +636,7 @@ class Loop:
         with the words of a limit at the end of its log. strict (the defender, whose output is the clone): any
         failure exit code, or those words with the clone unchanged. A run stopped at AGENT_TIMEOUT has not failed in
         this sense (it worked the whole time) and is not run again. reset() is called before each new try."""
-        tries = 0
+        tries, quick_count = 0, 0
         while True:
             before = file_digest(output) if output is not None else None
             name = step if tries == 0 else f"{step}-retry{tries}"
@@ -641,20 +651,28 @@ class Loop:
             if not failed:
                 return final
             why = f"{role}가 {name} 단계를 하지 못함 (exit {code}{', 로그에 한도 문구' if limited else ''})"
+            last = self.safe(last_line(log))  # what the agent said last: the cause, for loop/faults.tsv
+            quick = not limited and code != TIMED_OUT and seconds < FAIL_FAST
+            quick_count = quick_count + 1 if quick else 0
+            if quick_count >= FAIL_FAST_MAX:
+                raise AgentFailed(f"{why}. {int(seconds)}초 만에 한도 문구 없이 {quick_count}번 이어서 실패함: 설정(명령, 실행 파일, 모델 이름) "
+                                  f"문제로 봄. 로그 끝: {last} (로그 {final})")
             if tries >= self.s.retry_max or (tries > 0 and seconds > RETRY_QUICK):
-                raise AgentFailed(f"{why}. 사용량 한도일 수 있음. 다시 실행하면 루프 {self.n}부터 다시 함 (로그 {final})")
+                raise AgentFailed(f"{why}. 사용량 한도일 수 있음. 다시 실행하면 루프 {self.n}부터 다시 함. 로그 끝: {last} (로그 {final})")
             tries += 1
-            self.note(f"{why}: {self.s.retry_wait}초 뒤 다시 실행", attempt=f"{tries}/{self.s.retry_max}")
-            self.pause(self.s.retry_wait)
+            wait = min(FAIL_FAST_WAIT, self.s.retry_wait) if quick else self.s.retry_wait
+            self.note(f"{why}: {wait}초 뒤 다시 실행", attempt=f"{tries}/{self.s.retry_max}")
+            self.pause(wait, f"{why}. 로그 끝: {last}")
             if reset is not None:
                 reset()
 
-    def pause(self, seconds: int) -> None:
-        """Wait before a new try; loop/STOP ends the wait and the run."""
+    def pause(self, seconds: int, why: str = "") -> None:
+        """Wait before a new try; loop/STOP ends the wait and the run (the failure waited on goes with it)."""
         end = time.time() + seconds
         while time.time() < end:
             if (ROOT / "loop" / "STOP").exists():
-                raise AgentFailed(f"loop/STOP 파일이 있음 (루프 {self.n}에서 다시 실행을 기다리던 중)")
+                raise AgentFailed(f"loop/STOP 파일이 있음 (루프 {self.n}에서 다시 실행을 기다리던 중"
+                                  + (f". 기다린 실패: {why}" if why else "") + ")")
             time.sleep(min(15.0, max(0.0, end - time.time())))
 
     def agent_once(self, role: str, step: str, prompt: str, hidden: bool) -> tuple[Path, Path, int, float]:
@@ -1171,13 +1189,17 @@ class Loop:
         self.row["verify"] = "pass" if done.returncode == 0 else "fail"
         return done.returncode == 0
 
-    def test_cases(self, tree: Path, tests: list[str], label: str) -> tuple[int, dict[str, str]] | None:
+    def test_cases(self, tree: Path, tests: list[str], label: str, workspace: Path) -> tuple[int, dict[str, str]] | None:
         """Runs the test files in a copy of the code (cwd `tree`) and reads each test's result from pytest's own
         report: (pytest's exit code, test id -> "passed" | "failed" | "skipped"). A file that cannot be imported is
-        one failed entry of its own. None when the run did not happen or left no report."""
+        one failed entry of its own. None when the run did not happen or left no report.
+        KOSIS_WORKSPACE is an empty folder: the tests make their own tables (tests/conftest.py write_table), and the
+        code before the fix, whose table index code may differ, must not save scans next to the real tables
+        (<workspace>/data/index, which the measurements use)."""
         with tempfile.TemporaryDirectory(prefix="kosis_loop_tests_", ignore_cleanup_errors=True) as tmp:
             report = Path(tmp) / "report.xml"
-            env = os.environ | {"PYTHONPATH": os.pathsep.join([str(tree), str(tree / "src")])}
+            env = os.environ | {"PYTHONPATH": os.pathsep.join([str(tree), str(tree / "src")]),
+                                "KOSIS_WORKSPACE": str(workspace)}
             done = subprocess.run([self.s.python, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider",
                                    f"--junitxml={report}", "-o", "junit_family=xunit2"], cwd=tree, env=env,
                                   capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1204,22 +1226,22 @@ class Loop:
         Returns (state, a sentence for the record). state "failed": at least one such test, and none failing after.
         Reasons to revert: "none" (no test added or changed), "passed" (nothing fails before the fix), "unproven"
         (what fails before does not pass after) and "unknown" (the runs could not be read, tried twice).
-        "skipped" (the code before the fix is not run: the index code changed) leaves it to the critic, which then
-        has to say in its judgment why the test would fail there (records)."""
+        Both runs see an empty KOSIS_WORKSPACE (test_cases), so a change of the table index code (kosis_chat/shared,
+        prepare/index.py) is run before the fix too: the saved scans of the real tables are not touched. (Until
+        2026-11-22 such a change was not run before the fix and the critic's before_fix stood in for it; it was so in
+        every one of loops 1 to 4, as the defender changed kosis_chat/shared/patterns.py each time.)"""
         changes = self.clone_changes()
         tests = sorted(p for p in changes if p.startswith("tests/loop/") and p.endswith(".py")
                        and Path(p).name.startswith("test_") and (self.s.clone / p).is_file())
         if not tests:
             return "none", "방어자가 이번에 추가하거나 고친 테스트가 없음 (tests/loop)"
-        if any(p.startswith("kosis_chat/shared/") or p == "kosis_chat/prepare/index.py" for p in changes):
-            return "skipped", (f"추가·수정된 테스트 {len(tests)}개. 수정 전 코드로는 돌려 보지 않음 (색인 코드가 바뀌어, 돌리면 "
-                               f"큰 표의 저장된 색인을 다시 만들게 됨). 이 테스트가 이번 수정을 검증하는지는 평가자가 판단하고, "
-                               f"수정 전 코드에서 실패하는 이유를 판정 파일의 before_fix에 적음")
         head_text = f"추가·수정된 테스트 파일 {len(tests)}개를 수정 전 코드와 수정 후 코드에서 돌린 결과: "
         why = "확인하지 못함"
         for attempt in (1, 2):  # a run that could not be read is tried once more
             try:
                 with tempfile.TemporaryDirectory(prefix="kosis_loop_head_", ignore_cleanup_errors=True) as tmp:
+                    workspace = Path(tmp) / "workspace"  # empty: no data/, so no saved scan of a real table
+                    workspace.mkdir()
                     pack, head = Path(tmp) / "head.tar", Path(tmp) / "head"
                     if self.git("archive", "--format=tar", "-o", str(pack), "HEAD").returncode != 0:
                         why = "수정 전 코드를 꺼내지 못함"
@@ -1234,8 +1256,8 @@ class Loop:
                         if rel.startswith("tests/loop/") and src.is_file():
                             (head / rel).parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy(src, head / rel)
-                    before = self.test_cases(head, tests, "on HEAD, before the fix")
-                after = self.test_cases(self.s.clone, tests, "on the clone, after the fix")
+                    before = self.test_cases(head, tests, "on HEAD, before the fix", workspace)
+                    after = self.test_cases(self.s.clone, tests, "on the clone, after the fix", workspace)
             except subprocess.TimeoutExpired:
                 why = f"{TESTS_BEFORE_TIMEOUT}초 안에 끝나지 않음"
                 continue
@@ -1561,6 +1583,18 @@ def preflight(s: Settings) -> list[str]:
     for role, command in s.commands.items():
         if not command:
             problems.append(f"{role.upper()}_CMD 가 비어 있음 (loop/config.env)")
+            continue
+        for hole in PLACEHOLDER.findall(command):  # left from loop/config.example.env; bash would read < as a redirect
+            problems.append(f"{role.upper()}_CMD 에 예시의 자리표시자가 남아 있음: {hole} (loop/config.env)")
+        for name in sorted(set(re.findall(r"\$\{?([A-Z_][A-Z0-9_]*)\}?", command))):
+            value = os.environ.get(name, "")
+            if not value:  # (LOOP_NUM and LOOP_ROLE are set when the agent runs)
+                if name.endswith("_BIN"):
+                    problems.append(f"{role.upper()}_CMD 가 쓰는 {name} 가 비어 있음 (loop/config.env)")
+            elif PLACEHOLDER.search(value):
+                problems.append(f"{name} 에 예시의 자리표시자가 남아 있음: {PLACEHOLDER.search(value).group(0)} (loop/config.env)")
+            elif ("/" in value or "\\" in value) and not Path(value).is_file():
+                problems.append(f"{name} 의 파일이 없음: {value} (loop/config.env)")
     if not s.workspace or not (Path(s.workspace) / "data" / "tables.csv").exists():
         problems.append("KOSIS_WORKSPACE 가 data/tables.csv 가 있는 폴더가 아님")
     for rel in ("evals/baseline/items.jsonl", "evals/baseline/split.json", "loop/defender_allow.txt",

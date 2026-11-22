@@ -12,4 +12,8 @@ set +a
 # The bash that runs this script, for the commands loop_main.py starts (on Windows a bare "bash" can be WSL's).
 if command -v cygpath >/dev/null 2>&1; then LOOP_BASH="$(cygpath -w "$BASH")"; else LOOP_BASH="$BASH"; fi
 export LOOP_BASH PYTHONUTF8=1
-exec "${PYTHON:-python}" scripts/loop_main.py "$@"
+# The Python of the conda environment (CONDA_ENV, default kosis), first on PATH for the agents too.
+source scripts/use_python.sh
+use_python || { echo "시작할 수 없음" >&2; exit 1; }
+echo "파이썬: $PYTHON" >&2
+exec "$PYTHON" scripts/loop_main.py "$@"
