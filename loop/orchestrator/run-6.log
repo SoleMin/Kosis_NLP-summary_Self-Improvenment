@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[12:53:25] loop 6 · 기준 점수 · score=0.3928 · strict=0.3914 · reused=True · errors=1
+[12:53:25] loop 6 · 1-hint 시작 · role=critic
+[13:04:29] loop 6 · 1-hint 끝 · exit=0 · seconds=663
+[13:04:29] loop 6 · 2-attack-1 시작 · role=attacker
+[13:07:24] loop 6 · 2-attack-1 끝 · exit=0 · seconds=174
+[13:07:24] loop 6 · 3-judge1-1 시작 · role=critic
+[13:09:42] loop 6 · 3-judge1-1 끝 · exit=0 · seconds=137
+[13:09:42] loop 6 · 1차 판정 · specs=20 · rejected=0
+[13:09:43] loop 6 · 값 채우기 · built=20 · specs=20 · exit=0
+[13:09:43] loop 6 · 5-judge2 시작 · role=critic
+[13:12:26] loop 6 · 5-judge2 끝 · exit=0 · seconds=162
+[13:12:26] loop 6 · 2차 판정 · built=20 · kept=19
+[13:13:55] loop 6 · 수정 전 점수 · attack=0.0000 · attack_strict=0.0000 · past=0.3316 · errors=0
+[13:13:55] loop 6 · 7-brief-1 시작 · role=critic
+[13:25:50] loop 6 · 7-brief-1 끝 · exit=0 · seconds=714
+[13:25:50] loop 6 · 약점 설명 검사 · leaks=0
+[13:25:50] loop 6 · 8-defender 시작 · role=defender
+[13:40:31] loop 6 · 8-defender 끝 · exit=0 · seconds=881
+[13:40:31] loop 6 · 방어자 변경 · files=7
+[13:48:59] loop 6 · 유지 조건 · problem=없음
+[13:48:59] loop 6 · 10-review-1 시작 · role=critic
+[14:05:03] loop 6 · 10-review-1 끝 · exit=0 · seconds=963
+[14:05:03] loop 6 · 기록 초안 검사 · leaks=0
+[14:05:03] loop 6 끝: kept=1 (약점 설명의 A-1·A-2·A-3(합계 표시가 붙은 이름과 소계 구조), B-1·B-2(구간 이름을 다른 꼴로 부름), C(조사 이름·표 제목의 낱말이 대상으로 잡힘), G(같은 통계의 조사 연도별 표 쌍)를 원인 단계에서 고쳤다. 새 조건은 표의 정보(이름의 합계 표시, 대상의 순서, 조사 이름과 제목, 표마다 가진 시점·항목 이름·단위)와 공용 표현 사)
+종료: 한 번 실행함

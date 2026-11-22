@@ -1,0 +1,29 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[16:10:04] loop 7 · 기준 점수 · score=0.4224 · strict=0.4209 · reused=True · errors=1
+[16:10:04] loop 7 · 1-hint 시작 · role=critic
+[16:16:11] loop 7 · 1-hint 끝 · exit=0 · seconds=366
+[16:16:11] loop 7 · 2-attack-1 시작 · role=attacker
+[16:16:15] loop 7 · 2-attack-1 끝 · exit=1 · seconds=3
+[16:16:15] loop 7 · attacker가 2-attack-1 단계를 하지 못함 (exit 1, 로그에 한도 문구): 1800초 뒤 다시 실행 · attempt=1/12
+[16:46:15] loop 7 · 2-attack-1-retry1 시작 · role=attacker
+[16:51:03] loop 7 · 2-attack-1-retry1 끝 · exit=0 · seconds=288
+[16:51:04] loop 7 · 3-judge1-1 시작 · role=critic
+[16:54:25] loop 7 · 3-judge1-1 끝 · exit=0 · seconds=200
+[16:54:25] loop 7 · 1차 판정 · specs=20 · rejected=1
+[16:54:27] loop 7 · 값 채우기 · built=19 · specs=19 · exit=0
+[16:54:27] loop 7 · 5-judge2 시작 · role=critic
+[16:56:20] loop 7 · 5-judge2 끝 · exit=0 · seconds=112
+[16:56:20] loop 7 · 2차 판정 · built=19 · kept=19
+[16:58:31] loop 7 · 수정 전 점수 · attack=0.0263 · attack_strict=0.0263 · past=0.3289 · errors=0
+[16:58:31] loop 7 · 7-brief-1 시작 · role=critic
+[17:11:13] loop 7 · 7-brief-1 끝 · exit=0 · seconds=762
+[17:11:13] loop 7 · 약점 설명 검사 · leaks=0
+[17:11:14] loop 7 · 8-defender 시작 · role=defender
+[17:28:51] loop 7 · 8-defender 끝 · exit=0 · seconds=1057
+[17:28:51] loop 7 · 방어자 변경 · files=7
+[17:40:17] loop 7 · 유지 조건 · problem=없음
+[17:40:18] loop 7 · 10-review-1 시작 · role=critic
+[17:59:54] loop 7 · 10-review-1 끝 · exit=0 · seconds=1176
+[17:59:55] loop 7 · 기록 초안 검사 · leaks=0
+[17:59:55] loop 7 끝: kept=1 (약점 설명의 I(두 시점의 배율, 표 1개), C(대상마다의 두 시점 변화), B(집단 + 속성 이름을 떼어 부름), A-1(범위로만 부른 집단)을 원인 단계에서 고쳤다. 새 조건은 표의 정보(같은 분류의 다른 이름과 합계 이름의 줄기로 가른 집단·속성, 합계·조상·집단 관계)와 공용 표현 사전의 부류(저마다를 뜻하는 말, 어느 쪽이 더한지 견주는 말, 있)
+종료: 한 번 실행함

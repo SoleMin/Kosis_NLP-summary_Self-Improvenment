@@ -1542,6 +1542,9 @@ class Loop:
                     f"- {name}: {self.row[f'{key}_before']} → {self.row[f'{key}_after']} (칸 일치 점수 "
                     f"{self.row[f'{key}_strict_before']} → {self.row[f'{key}_strict_after']})\n"
                     for name, key in (("기준 데이터(판정용)", "dev"), ("이번 공격 문항", "attack"), ("지난 공격 문항", "past"))
+                ) + "".join(  # each earlier attack set on its own, as the keep condition compares them (2026-11-22)
+                    f"- {name}: {pair(before)[0]} → {pair(after)[0]} (칸 일치 점수 {pair(before)[1]} → {pair(after)[1]})\n"
+                    for name, before, after in sets if before is not None and after is not None
                 ) + metrics
         self.note("유지 조건", problem=problem or "없음")
 

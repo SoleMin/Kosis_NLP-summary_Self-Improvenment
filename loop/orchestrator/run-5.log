@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[11:25:30] loop 5 · 기준 점수 · score=0.3816 · strict=0.3801 · reused=True · errors=1
+[11:25:30] loop 5 · 1-hint 시작 · role=critic
+[11:39:03] loop 5 · 1-hint 끝 · exit=0 · seconds=813
+[11:39:03] loop 5 · 2-attack-1 시작 · role=attacker
+[11:43:37] loop 5 · 2-attack-1 끝 · exit=0 · seconds=273
+[11:43:37] loop 5 · 3-judge1-1 시작 · role=critic
+[11:46:59] loop 5 · 3-judge1-1 끝 · exit=0 · seconds=202
+[11:46:59] loop 5 · 1차 판정 · specs=20 · rejected=0
+[11:47:01] loop 5 · 값 채우기 · built=20 · specs=20 · exit=0
+[11:47:01] loop 5 · 5-judge2 시작 · role=critic
+[11:48:40] loop 5 · 5-judge2 끝 · exit=0 · seconds=99
+[11:48:40] loop 5 · 2차 판정 · built=20 · kept=20
+[11:50:06] loop 5 · 수정 전 점수 · attack=0.0125 · attack_strict=0.0125 · past=0.3133 · errors=0
+[11:50:06] loop 5 · 7-brief-1 시작 · role=critic
+[12:11:15] loop 5 · 7-brief-1 끝 · exit=0 · seconds=1269
+[12:11:16] loop 5 · 약점 설명 검사 · leaks=0
+[12:11:16] loop 5 · 8-defender 시작 · role=defender
+[12:25:22] loop 5 · 8-defender 끝 · exit=0 · seconds=846
+[12:25:22] loop 5 · 방어자 변경 · files=7
+[12:33:45] loop 5 · 유지 조건 · problem=없음
+[12:33:45] loop 5 · 10-review-1 시작 · role=critic
+[12:46:26] loop 5 · 10-review-1 끝 · exit=0 · seconds=760
+[12:46:26] loop 5 · 기록 초안 검사 · leaks=0
+[12:46:26] loop 5 끝: kept=1 (약점 설명의 B(이름 붙인 시점에 기대는 바로 앞 시점과 그 답 고르기), C-1(한 분류의 대상 셋 이상 값 나열), A(같은 이름 목록을 가진 두 분류의 출발 쪽·도착 쪽 역할)를 원인 단계에서 고쳤다. B는 옆에 분기를 붙이지 않고 있던 '몇 해 전' 자리를 넓혔고, A는 표의 정보(두 분류의 이름 목록이 같은지, 분류 이름이 어느 역할로 읽히는지)와)
+종료: 한 번 실행함

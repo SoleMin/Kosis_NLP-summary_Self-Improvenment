@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[23:10:41] loop 3 · 기준 점수 · score=0.3334 · strict=0.3320 · reused=True · errors=1
+[23:10:41] loop 3 · 1-hint 시작 · role=critic
+[23:19:35] loop 3 · 1-hint 끝 · exit=0 · seconds=533
+[23:19:35] loop 3 · 2-attack-1 시작 · role=attacker
+[23:24:06] loop 3 · 2-attack-1 끝 · exit=0 · seconds=271
+[23:24:07] loop 3 · 3-judge1-1 시작 · role=critic
+[23:27:55] loop 3 · 3-judge1-1 끝 · exit=0 · seconds=228
+[23:27:56] loop 3 · 1차 판정 · specs=20 · rejected=0
+[23:27:57] loop 3 · 값 채우기 · built=20 · specs=20 · exit=0
+[23:27:57] loop 3 · 5-judge2 시작 · role=critic
+[23:29:24] loop 3 · 5-judge2 끝 · exit=0 · seconds=86
+[23:29:24] loop 3 · 2차 판정 · built=20 · kept=20
+[23:30:11] loop 3 · 수정 전 점수 · attack=0.0167 · attack_strict=0.0167 · past=0.4428 · errors=0
+[23:30:11] loop 3 · 7-brief-1 시작 · role=critic
+[23:38:29] loop 3 · 7-brief-1 끝 · exit=0 · seconds=497
+[23:38:29] loop 3 · 약점 설명 검사 · leaks=0
+[23:38:29] loop 3 · 8-defender 시작 · role=defender
+[23:54:39] loop 3 · 8-defender 끝 · exit=0 · seconds=970
+[23:54:39] loop 3 · 방어자 변경 · files=10
+[00:03:16] loop 3 · 유지 조건 · problem=없음
+[00:03:16] loop 3 · 10-review-1 시작 · role=critic
+[00:15:07] loop 3 · 10-review-1 끝 · exit=0 · seconds=710
+[00:15:07] loop 3 · 기록 초안 검사 · leaks=0
+[00:15:08] loop 3 끝: kept=1 (약점 설명의 A-1·A-2(1위가 아닌 등수, 앞에서부터 여럿), A-3(두 시점 사이의 변화로 매기는 순위), A-4(최대와 최소를 함께 불러 하는 계산, 시점 후보 판정), E-3(연평균 증가율)을 원인 단계에서 고쳤고, 새 조건은 특정 문항·표·분류가 아니라 표현 부류(공용 표현 사전)와 질문에서 읽은 시점의 개수로 정해진다. 계획 형식에는 순위 단계)
+종료: 한 번 실행함
