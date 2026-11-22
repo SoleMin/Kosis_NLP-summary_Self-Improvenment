@@ -900,16 +900,54 @@ class Loop:
         (ROOT / "evals" / "runs" / "dev_scores.json").write_text(json.dumps(cache, indent=1), encoding="utf-8")
 
     def measure_past(self, tag: str) -> dict | None:
-        """Every earlier loop's attack items as one score (mean over items). None when there are none."""
-        parts = [self.measure(f"{tag}-{f.stem}", f) for f in attack_sets(self.n) if load_jsonl(f)]
-        if not parts:
+        """Every earlier loop's attack items as one score (mean over items), with each set's own measurement under
+        "sets" (name -> measurement): the keep condition looks at every set (2026-11-22). None when there are none."""
+        named = [(f.stem, self.measure(f"{tag}-{f.stem}", f)) for f in attack_sets(self.n) if load_jsonl(f)]
+        if not named:
             return None
+        parts = [p for _, p in named]
         if any(p["score"] is None or p["strict"] is None for p in parts):
-            return {"score": None, "strict": None, "errors": -1, "unread": 0, "items": 0}
+            return {"score": None, "strict": None, "errors": -1, "unread": sum(p["unread"] for p in parts), "items": 0,
+                    "sets": dict(named)}
         total = sum(p["items"] for p in parts)
         return {"score": sum(p["score"] * p["items"] for p in parts) / total,
                 "strict": sum(p["strict"] * p["items"] for p in parts) / total,
-                "errors": sum(p["errors"] for p in parts), "unread": sum(p["unread"] for p in parts), "items": total}
+                "errors": sum(p["errors"] for p in parts), "unread": sum(p["unread"] for p in parts), "items": total,
+                "sets": dict(named)}
+
+    def item_changes(self, dev: dict, dev2: dict, past: dict | None, past2: dict | None) -> str:
+        """How many items' scores fell and rose with the change, in the dev part and in the earlier attack sets: counts
+        only (no id, no question), for outcome.md, which the critic and a person read. Not a keep condition: the
+        totals decide (2026-11-22). A fall here is a regression the next loop may have to fix."""
+        def grades(part: dict | None) -> dict[str, tuple[float, float]]:
+            file = Path(part["run"]) / "graded.jsonl" if part and part.get("run") else None
+            if file is None or not file.is_file():
+                return {}
+            return {r["id"]: (float(r.get("score") or 0), float(r.get("score_same_inputs") or 0)) for r in load_jsonl(file)}
+
+        def count(pairs: list[tuple[dict | None, dict | None]]) -> tuple[int, int, int] | None:
+            fell = rose = compared = 0
+            for before, after in pairs:
+                was, now = grades(before), grades(after)
+                if not was or not now:
+                    return None
+                for key in was.keys() & now.keys():
+                    compared += 1
+                    if now[key][0] < was[key][0] - EPS or now[key][1] < was[key][1] - EPS:
+                        fell += 1
+                    elif now[key][0] > was[key][0] + EPS or now[key][1] > was[key][1] + EPS:
+                        rose += 1
+            return fell, rose, compared
+
+        lines = []
+        old = [((past or {}).get("sets", {}).get(n), (past2 or {}).get("sets", {}).get(n)) for n in (past or {}).get("sets", {})]
+        for name, pairs in (("기준 데이터(판정용)", [(dev, dev2)]), ("지난 공격 문항", old)):
+            if not pairs:
+                continue
+            got = count(pairs)
+            lines.append(f"- 문항별 변화, {name}: " + ("문항별 결과를 읽지 못함" if got is None else
+                         f"{got[2]}건 중 점수가 떨어진 문항 {got[0]}건, 오른 문항 {got[1]}건"))
+        return "".join(line + "\n" for line in lines)
 
     @property
     def errors_count(self) -> bool:
@@ -1474,9 +1512,13 @@ class Loop:
                 # attack has to rise by the same-inputs score (a number that equals the answer but is made from other
                 # cells raises the plain score alone: evals/grade.py) and may not fall by the plain one: a fix that
                 # only makes the right cells be read is an improvement too.
+                # Each earlier attack set on its own too (2026-11-22): a fall in one set is not made up by a rise in
+                # another. A set measured after the fix only (none) is not compared.
                 failed = []
-                for name, before, after in (("기준 데이터", dev, dev2), ("지난 공격 문항", past, past2)):
-                    if before is None:
+                sets = [(f"지난 공격 문항({name})", part, (past2 or {}).get("sets", {}).get(name))
+                        for name, part in sorted((past or {}).get("sets", {}).items())]
+                for name, before, after in (("기준 데이터", dev, dev2), ("지난 공격 문항", past, past2), *sets):
+                    if before is None or after is None:
                         continue
                     for key, label in (("score", "점수"), ("strict", "칸 일치 점수")):
                         if after[key] < before[key] - EPS:
@@ -1496,7 +1538,7 @@ class Loop:
                 elif tested == "unknown":
                     failed.append("방어자의 테스트를 수정 전 코드에서 확인하지 못함")
                 problem = ", ".join(failed) or None
-                metrics = "".join(
+                metrics = self.item_changes(dev, dev2, past, past2) + "".join(
                     f"- {name}: {self.row[f'{key}_before']} → {self.row[f'{key}_after']} (칸 일치 점수 "
                     f"{self.row[f'{key}_strict_before']} → {self.row[f'{key}_strict_after']})\n"
                     for name, key in (("기준 데이터(판정용)", "dev"), ("이번 공격 문항", "attack"), ("지난 공격 문항", "past"))
