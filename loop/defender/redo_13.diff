@@ -1,0 +1,1372 @@
+diff --git a/kosis_chat/analyze/multi_rules.py b/kosis_chat/analyze/multi_rules.py
+index 0dd9b89..67f0aae 100644
+--- a/kosis_chat/analyze/multi_rules.py
++++ b/kosis_chat/analyze/multi_rules.py
+@@ -39,7 +39,7 @@ from typing import Literal
+ from pydantic import Field, SkipValidation
+ 
+ from kosis_chat.analyze import blocks as build
+-from kosis_chat.analyze.rules import _fixed, _lookup, _named_one_by_one, rule_plan
++from kosis_chat.analyze.rules import _fixed, _lookup, _named_one_by_one, _number_range, _total, rule_plan
+ from kosis_chat.analyze.schemas import Built, Plan
+ from kosis_chat.judge.question import (
+     AVG_WORDS,
+@@ -165,6 +165,11 @@ class _Side:
+         # loop 12: the items a question names one by one and asks for each of ("남자와 여자 각각"): the calculation is
+         # repeated per item (_fixed_sets), as per region
+         self.each_item: list[str] = []
++        # loop 13: the category whose names a range of numbers picks ("20대", "50명 이상": rules._number_range); its
++        # names are one target, summed per table (_fixed_sets, _repeated)
++        found = _number_range(question, res.index)
++        self.ranged: str | None = found[0] if found and len(found[1]) >= 2 else None
++        self.summed = False
+ 
+     @property
+     def tbl_id(self) -> str:
+@@ -195,6 +200,14 @@ def _assign_items(sides: list[_Side], question: str) -> None:
+         else:
+             spans = []
+         side.at = min(a for a, _ in spans) if spans else None
++    # loop 13: a table whose item the question does not name, when every other table's is named, is asked at its
++    # whole item as the index decides it (rules._total: a total name, or the one name every other one nests under:
++    # '취업자' over '농림어업', '제조업'), as the one-table rules fill an unnamed category; a table of different
++    # measures has no whole and stays open (_fixed_sets)
++    for side in sides:
++        if side.item is None and not side.each_item and all(o.item or o.each_item for o in sides if o is not side):
++            if ITEM_AXIS in side.index.axes and (whole := _total(side.index, ITEM_AXIS)) is not None:
++                side.item = whole
+ 
+ 
+ # ---------------------------------------------------------------- what is computed
+@@ -314,6 +327,7 @@ def _fixed_sets(side: _Side) -> list[dict[str, str]]:
+     else:
+         codes[ITEM_AXIS] = [side.item]
+     several = {n: v for n, v in codes.items() if len(v) > 1 and (n != ITEM_AXIS or side.each_item)}
++    side.summed = list(several) == [side.ranged] if side.ranged else False  # loop 13: the range's names, one target
+     problems: list[str] = []
+     base = _fixed(side.plan.model_copy(update={"codes": {k: v for k, v in codes.items() if k not in several}}),
+                   side.index, set(several), problems)
+@@ -352,8 +366,11 @@ def _aligned(counts: list[int], what: str) -> int:
+     return n
+ 
+ 
+-def _combined(op: Op, ids: list[str], scale: float | None, directed: bool, tag: str) -> tuple[list, str, str]:
+-    """(steps, result id, present) of one calculation between the tables' values ids (formula order)."""
++def _combined(op: Op, ids: list[str], scale: float | None, directed: bool, tag: str,
++              summed_whole: bool = False) -> tuple[list, str, str]:
++    """(steps, result id, present) of one calculation between the tables' values ids (formula order). Loop 13:
++    summed_whole: a share's whole is a sum of cells (a range of names, side.summed), which compute's share does not
++    take as its whole; the share is then the part over the sum times 100 (index)."""
+     if op == "sum":
+         steps, last = [], ids[0]
+         for n, other in enumerate(ids[1:], start=1):
+@@ -367,7 +384,8 @@ def _combined(op: Op, ids: list[str], scale: float | None, directed: bool, tag:
+         orient = "fixed" if directed else "larger_first"
+         return [CombineStep(id=f"d{tag}", a=a, b=b, fn="diff", orient=orient, note="차이")], f"d{tag}", "compare"
+     if op == "share":
+-        return [CombineStep(id=f"r{tag}", a=a, b=b, fn="share", note="비중")], f"r{tag}", "share"
++        fn = "index" if summed_whole else "share"
++        return [CombineStep(id=f"r{tag}", a=a, b=b, fn=fn, note="비중")], f"r{tag}", "share"
+     if op == "per":
+         return [CombineStep(id=f"r{tag}", a=a, b=b, fn="per", scale=scale, note=f"{b} {scale:g}당")], f"r{tag}", "compare"
+     if op == "relative":  # loop 12: (subject - reference) / reference * 100, as one table's build.relative
+@@ -406,23 +424,31 @@ def _repeated(op: Op, order: list[_Side], fixed: dict, asked: dict, scale: float
+     "avg"), each table's cells over the asked range are aggregated first and the calculation is made on the results
+     ("2019~2021년 출생아 수 합계를 혼인 건수 합계로 나누면"). One group of one target and one period is the plan of
+     loop 1 (ids t0, t1, then d / r / s1)."""
+-    targets = _aligned([len(fixed[id(s)]) for s in order], "대상")
++    targets = _aligned([1 if s.summed else len(fixed[id(s)]) for s in order], "대상")
+     periods = 1 if aggregate else _aligned([len(asked[id(s)]) for s in order], "시점")
+     if aggregate and op == "share":
+         raise _Open("기간 합의 비중")  # compute's share takes cells as the whole, not an aggregate
++    # loop 13: a table whose range of names is summed (side.summed): its cells at one period are added up first; not
++    # over a range of periods too
++    if any(s.summed for s in order) and aggregate:
++        raise _Open("구간 합의 기간 합")
+     groups = [(k, t) for k in range(targets) for t in range(periods)]
+     one = len(groups) == 1
+     per_side: dict[int, list[list[str]]] = {}
+     for side in order:
+         sets, mine = fixed[id(side)], asked[id(side)]
+-        wanted = [(sets[k % len(sets)], mine if aggregate else [mine[t % len(mine)]]) for k, t in groups]
+-        pairs = [(f, p) for f, ps in wanted for p in ps]
++        if side.summed:
++            wanted = [[(f, mine[t % len(mine)]) for f in sets] for _, t in groups]
++        else:
++            wanted = [[(sets[k % len(sets)], p) for p in (mine if aggregate else [mine[t % len(mine)]])]
++                      for k, t in groups]
++        pairs = [pair for group in wanted for pair in group]
+         found = _lookup(side.res.table).cells(pairs)
+         missing = [f"{side.tbl_id} {p}" for (f, p), c in zip(pairs, found) if c is None]
+         if missing:
+             raise _Open(f"칸 없음: {', '.join(missing[:3])}")
+         refs = iter(c.source_ref for c in found)
+-        per_side[id(side)] = [[next(refs) for _ in ps] for _, ps in wanted]
++        per_side[id(side)] = [[next(refs) for _ in group] for group in wanted]
+     steps: list = []
+     show: list[str] = []
+     present = "compare"
+@@ -433,13 +459,13 @@ def _repeated(op: Op, order: list[_Side], fixed: dict, asked: dict, scale: float
+             sid = f"t{n}{tag}"
+             refs = per_side[id(side)][g]
+             steps.append(SelectStep(id=sid, cells=refs, table=side.tbl_id))
+-            if aggregate and len(refs) >= 2:
+-                steps.append(AggregateStep(id=f"a{n}{tag}", of=sid, fn=aggregate))
++            if (aggregate or side.summed) and len(refs) >= 2:
++                steps.append(AggregateStep(id=f"a{n}{tag}", of=sid, fn=aggregate or "sum"))
+                 sid = f"a{n}{tag}"
+             elif len(refs) != 1:
+                 raise _Open(f"{side.tbl_id}: 합할 시점 부족")
+             ids.append(sid)
+-        more, result, present = _combined(op, ids, scale, directed, tag)
++        more, result, present = _combined(op, ids, scale, directed, tag, order[-1].summed)
+         steps += more
+         cells = [f"t{n}{tag}" for n in range(len(order))]
+         show += [*cells, *[i for i in ids if i not in cells], result]
+diff --git a/kosis_chat/analyze/rules.py b/kosis_chat/analyze/rules.py
+index 974552e..7e05502 100644
+--- a/kosis_chat/analyze/rules.py
++++ b/kosis_chat/analyze/rules.py
+@@ -41,12 +41,13 @@ from kosis_chat.judge.question import group_parts_of  # isort: skip  # loop 7
+ from kosis_ai.schemas import PlanV3, QuestionType, SelectStep, StatQuery  # isort: skip
+ from kosis_chat.analyze.schemas import Plan  # isort: skip  # re-export: moved in T1-28 S1b
+ from kosis_chat.shared import defaults as default_strings  # isort: skip
++from kosis_chat.shared.labels import INF, asked_ranges, label_bounds  # isort: skip  # loop 13: ranges of numbered names
+ from kosis_chat.shared.patterns import CHANGE_ASKED, PER_UNIT, RATE_OF_CHANGE, RECENT_N, REGION_SUFFIX, asked_comparison, per_scale  # isort: skip
+ from kosis_chat.shared.patterns import MOST_RECENT  # isort: skip  # "가장 최근 ~" names a period, not a ranking
+ from kosis_chat.shared.patterns import ASKS_GAP, ASKS_PERIOD, ASKS_RATIO, CHANGE_DOWN, EXTREME_MAX, RANK_WORDS, rank_places  # isort: skip
+ from kosis_chat.shared.patterns import EACH_PERIOD, EXCLUDE, years_step  # isort: skip  # loop 4
+ from kosis_chat.shared.patterns import DEST_AFTER, DEST_AXIS, ORIGIN_AFTER, ORIGIN_AXIS, REVERSE  # isort: skip  # loop 5
+-from kosis_chat.shared.patterns import WITHIN_AFTER  # isort: skip  # loop 6
++from kosis_chat.shared.patterns import WHOLE_AFTER, WITHIN_AFTER  # isort: skip  # loop 6, loop 13
+ from kosis_chat.shared.patterns import EACH_TARGET, PERCENT, WHICH_MORE  # isort: skip  # loop 7
+ from kosis_chat.shared.patterns import asks_level  # isort: skip  # loop 8
+ from kosis_chat.shared.patterns import COUNT_STEM_SUFFIX, TOTAL_AMOUNT, asks_gap_of, asks_relative  # isort: skip  # loop 9
+@@ -171,42 +172,93 @@ def _question_type(question: str, periods: Periods, codes: dict[str, list[str]],
+     return "value"
+ 
+ 
++def _numbered(axis) -> tuple[dict[str, tuple[float, float]], str] | None:
++    """Loop 13: (code -> (low, high), the counting word) of a category whose names are numbers (shared label_bounds:
++    intervals '20-24세', single numbers '3인', open ends '85세 이상', '15세미만'), totals left out; the counting word is
++    the one the names carry (names with a number only count in it too: '0-4세', '5-9', ...). None when fewer than two
++    names are numbered or the names carry two counting words or none."""
++    found: dict[str, tuple[float, float]] = {}
++    units: set[str] = set()
++    for code, label in axis.labels.items():
++        if is_total(label) or (b := label_bounds(label)) is None:
++            continue
++        found[code] = (b[0], b[1])
++        if b[2]:
++            units.add(b[2])
++    return (found, units.pop()) if len(found) >= 2 and len(units) == 1 else None
++
++
++def _cover(spans: dict[str, tuple[float, float]], low: float, high: float) -> list[str] | None:
++    """Loop 13: the names whose intervals put end to end make exactly [low, high] (an open low starts at the smallest
++    name, an open high ends at the largest one or an open name), each step the widest name that fits; None when the
++    range's bounds fall inside a name."""
++    if low == -INF:
++        low = min(lo for lo, _ in spans.values())
++    if high == INF:
++        tops = [hi for _, hi in spans.values()]
++        high = INF if INF in tops else max(tops)
++    picked, at = [], low
++    while at <= high:
++        fits = [(hi, c) for c, (lo, hi) in spans.items() if lo == at and hi <= high]
++        if not fits:
++            return None
++        hi, code = max(fits)
++        picked.append(code)
++        if hi == INF:
++            break
++        at = hi + 1
++    return picked
++
++
+ def _number_range(question: str, index: TableIndex) -> tuple[str, list[str]] | None:
+     """'3인 이하' -> (axis, [1인, 2인, 3인] codes); '5인 이상' -> 5인 + the smallest 'K인 이상' above (no double count);
+-    '65세 이상' on a category that holds '65세이상' itself -> that code alone (loop 8)."""
+-    m = _NUM_RANGE.search(question)
+-    if not m:
+-        return None
+-    n, unit, how = int(m.group(1)), m.group(2), m.group(3)
+-    for name, axis in index.axes.items():
+-        numbered = {}
+-        for code, label in axis.labels.items():
+-            if (lm := _NUM_LABEL.match(label.strip())) and lm.group(2) == unit:
+-                numbered[code] = (int(lm.group(1)), bool(lm.group(3)))
+-        if len(numbered) < 2:
++    '65세 이상' on a category that holds '65세이상' itself -> that code alone (loop 8).
++
++    Loop 13: any range the question says (shared asked_ranges: one bound and an open end, two bounds, a ten-year group)
++    over the names of a category that are numbers in the range's counting word (_numbered: intervals, single numbers
++    and open ends alike, on the item column too), when the names put end to end cover it exactly (_cover). A range
++    whose words are in the table's title or in a name that is no number ('15세 이상 인구': the group the table counts)
++    is no such range. Only one range: two ranges each picking names is left to the names the question gives."""
++    title = squash(getattr(index.table.meta, "tbl_nm", "") or "")
++    words = [squash(label) for axis in index.axes.values() for label in axis.labels.values()
++             if label_bounds(label) is None]
++    picks: list[tuple[str, list[str]]] = []
++    for text, low, high, unit in asked_ranges(question):
++        said = squash(text)
++        if said in title or any(said in w for w in words):
+             continue
+-        exact = {code: k for code, (k, open_) in numbered.items() if not open_}
+-        opened = {code: k for code, (k, open_) in numbered.items() if open_}
+-        if how in ("이하", "미만"):
+-            top = n if how == "이하" else n - 1
+-            return name, sorted((c for c, k in exact.items() if k <= top), key=exact.get)
+-        low = n if how == "이상" else n + 1
+-        # loop 8: an open interval that starts at the asked bound ('65세이상' for "65세 이상") is the whole range
+-        if same := sorted(c for c, k in opened.items() if k == low):
+-            return name, same[:1]
+-        tail = min(((k, c) for c, k in opened.items() if k > low), default=None)
+-        end = tail[0] if tail else max(exact.values()) + 1
+-        picked = sorted((c for c, k in exact.items() if low <= k < end), key=exact.get)
+-        return name, picked + ([tail[1]] if tail else [])
+-    return None
++        for name, axis in index.axes.items():
++            numbered = _numbered(axis)
++            if numbered is None or numbered[1] != unit:
++                continue
++            if (picked := _cover(numbered[0], low, high)) is not None:
++                picks.append((name, picked))
++                break
++    picks = list(dict.fromkeys((name, tuple(codes)) for name, codes in picks))  # the same range said twice
++    if len(picks) != 1:
++        return None
++    picks = [(picks[0][0], list(picks[0][1]))]
++    # one name picked is the name the question gives (the parser matches it), but for an open range (loop 8)
++    if len(picks[0][1]) == 1 and not any(INF in (abs(lo), abs(hi)) for _, lo, hi, _ in asked_ranges(question)):
++        return None
++    return picks[0]
+ 
+ 
+ def _both_sexes(question: str, index: TableIndex, codes: dict[str, list[str]]) -> None:
+-    if not _BOTH_SEXES.search(question):
++    """The two sexes when the question names them as one word (_BOTH_SEXES: "남녀", "성별"). Loop 13: followed by a
++    word of the whole (shared WHOLE_AFTER: "남녀 전체", "남녀 합쳐서", "남녀 모두 통틀어"), the category's total alone."""
++    m = _BOTH_SEXES.search(question)
++    if not m:
+         return
++    whole = bool(WHOLE_AFTER.match(squash(question[m.end():])))
++    if whole and re.search(r"남자|여자|남성|여성", question[: m.start()] + " " + question[m.end():]):
++        return  # "남녀 전체 중 여자 비중": the sex named apart is the part, the whole is the total (filled later)
+     for name, axis in index.axes.items():
+         pair = [c for c, label in axis.labels.items() if label.strip() in ("남자", "여자")]
+-        if len(pair) == 2 and len(codes.get(name, [])) < 2:
++        if len(pair) == 2 and whole and (total := _total(index, name)) is not None and total not in pair:
++            if len([c for c in codes.get(name, []) if c != total]) < 2:
++                codes[name] = [total]
++        elif len(pair) == 2 and len(codes.get(name, [])) < 2:
+             codes[name] = sorted(pair, key=lambda c: axis.labels[c] != "남자")
+ 
+ 
+@@ -321,17 +373,22 @@ def _period_groups(p: Periods, index: TableIndex, kind: QuestionType, months: bo
+ 
+ 
+ def _operation(question: str, rest: str, p: Periods, index: TableIndex, kind: QuestionType,
+-               months: bool = False, targets: bool = False) -> tuple[Pattern | None, list[list[str]]]:
++               months: bool = False, targets: bool = False,
++               ranged: bool = False) -> tuple[Pattern | None, list[list[str]]]:
+     """(pattern, period groups) when the question aggregates periods; (None, []) for the five plain types.
+ 
+     rest is the question with matched labels removed, so "평균" in a label ('평균 가구원수') does not count.
+-    targets (loop 9): the question names two targets or more of one category to add (_adds_targets)."""
++    targets (loop 9): the question names two targets or more of one category to add (_adds_targets).
++    ranged (loop 13): those targets are the names a range of numbers picks (_number_range)."""
+     groups = _period_groups(p, index, kind, months)
+     average = bool(AVG_WORDS.search(rest))
+     # "모두" / "전부" sums a range, but not a range asked period by period ("연도별로 모두 알려줘", loop 4); loop 9: and
+     # the targets named at one period when it comes right before 몇 + a counting word ("서울과 부산은 모두 몇 명")
+     total = bool(SUM_WORDS.search(rest) or (TOTAL_WORDS.search(rest) and p.ranges and not EACH_PERIOD.search(rest))
+-                 or (targets and not p.ranges and len(p.singles) <= 1 and TOTAL_AMOUNT.search(rest)))
++                 or (targets and not p.ranges and len(p.singles) <= 1 and TOTAL_AMOUNT.search(rest))
++                 # loop 13: the names a range of numbers picks (_number_range: "20대", "10~49명") are one target, their
++                 # sum, at one period, with no word that adds them; a share takes them as its part (build.share)
++                 or (ranged and kind not in ("share", "extreme") and not p.ranges and len(p.singles) <= 1))
+     if kind == "share":
+         if _part_of_year([x for g in groups for x in g]):  # "2025년 중 12월 비중": one share, not two compared
+             return None, []
+@@ -430,7 +487,8 @@ def rule_plan(question: str, index: TableIndex, default_applied: dict[str, str]
+     plan = Plan(question, kind, codes, periods, missing_years=missing, default_applied=default,
+                 events=list(parsed.periods.events), pairs=pairs, pair_reference=pair_reference)
+     plan.pattern, plan.groups = _operation(question, parsed.rest, parsed.periods, index, kind, months,
+-                                           _adds_targets(parsed, codes, ranged))
++                                           _adds_targets(parsed, codes, ranged),
++                                           ranged is not None and len(codes.get(ranged, [])) >= 2)
+     if (kind in ("value", "compare") and (plan.pattern is None or (plan.pattern == "sum" and not plan.groups))
+             and _excluded(question, index, codes, periods)):
+         plan.pattern, plan.groups, plan.type = "excl", [], "compare"  # loop 4: the total minus the part left out
+@@ -802,7 +860,13 @@ def _within(question: str, index: TableIndex, name: str) -> list[str]:
+             if q.startswith("의", end):
+                 end += 1
+             nxt = next((f for f in forms if q.startswith(f, end)), None)
+-            if nxt is None:
++            # loop 13: a word of the whole ("경기도 전체 인구 중": shared WHOLE_AFTER), the count and the unit noun of
++            # the members ("경기도의 4개 시 중": _MEMBER_COUNT) are read past as the other names are
++            # and the two sexes named as one word ("서울 남녀 전체 인구 중": _BOTH_SEXES) is a name as the others are
++            if nxt is None and (m := WHOLE_AFTER.match(q[end:]) or _BOTH_SEXES.match(q[end:])
++                                or _member_words(q[end:], index, name)):
++                nxt = m.group(0) if isinstance(m, re.Match) else m
++            if not nxt:
+                 return end
+             end += len(nxt)
+ 
+@@ -819,6 +883,31 @@ def _within(question: str, index: TableIndex, name: str) -> list[str]:
+     return [c for _, c in sorted(found)]
+ 
+ 
++_MEMBER_COUNT = re.compile(r"(?:\d+|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)?(?:개|곳|군데)?")
++
++
++def _member_ends(index: TableIndex, name: str) -> str:
++    """Loop 13: the last letters the names of a regional category's members end with ('시', '군', '구': the units a
++    question calls them by), each shared by two members or more; '' for a category that is not regional or has no
++    members."""
++    axis = index.axes[name]
++    if not axis.regional:
++        return ""
++    ends = [label.strip()[-1] for c, label in axis.labels.items() if axis.parents.get(c) is not None and label.strip()]
++    return "".join(sorted({e for e in ends if ends.count(e) >= 2 and "가" <= e <= "힣"}))
++
++
++def _member_words(text: str, index: TableIndex, name: str) -> str:
++    """Loop 13: the squashed words right after a region's name that count or name its members ("4개시", "다섯개구",
++    "시군", "구들"): an optional count and counting word (_MEMBER_COUNT), then a unit noun made of the letters the
++    members' names end with (_member_ends) and an optional 들. '' when there is no unit noun."""
++    ends = _member_ends(index, name)
++    if not ends:
++        return ""
++    m = re.match(_MEMBER_COUNT.pattern + rf"([{ends}]{{1,3}})들?", text)
++    return m.group(0) if m else ""
++
++
+ def _holds(index: TableIndex, name: str, whole: str, code: str) -> bool:
+     """Loop 7: the code `whole` of a category is a group that holds `code`: the category's total (a total name with no
+     parent), an ancestor of it, or the group its name is made of (judge group_parts: '귀농인-계' holds '귀농인-여자')."""
+@@ -858,9 +947,19 @@ def _children(index: TableIndex, name: str, code: str) -> list[str]:
+ def _scope(question: str, index: TableIndex, codes: dict[str, list[str]]) -> str | None:
+     """Loop 6: the category a ranking looks inside a named group of (one code named right before a word of looking
+     inside, WITHIN_AFTER, that has members in the table: a subtotal and its details, a region and its districts); its
+-    members are the candidates (_pool). None when there is no such group."""
++    members are the candidates (_pool). None when there is no such group.
++
++    Loop 13: also a region named with no such word when the noun that names the candidates (shared candidate_nouns)
++    is the unit its members are called by (_member_words: "경기도에서 인구가 가장 많은 시는", "부산의 가장 큰 구"): the
++    region's members are the candidates."""
+     for name, named in codes.items():
+-        if len(named) == 1 and _children(index, name, named[0]) and named[0] in _within(question, index, name):
++        if len(named) != 1 or not _children(index, name, named[0]):
++            continue
++        if named[0] in _within(question, index, name):
++            return name
++        if (ends := _member_ends(index, name)) and any(
++                re.match(rf"[{ends}]{{1,3}}들?(?:은|는|이|가|을|를|의|와|과|으로|로|$|[?.!,])", noun)
++                for noun in candidate_nouns(question)):
+             return name
+     return None
+ 
+diff --git a/kosis_chat/judge/rules.py b/kosis_chat/judge/rules.py
+index a5b233d..3c39436 100644
+--- a/kosis_chat/judge/rules.py
++++ b/kosis_chat/judge/rules.py
+@@ -43,7 +43,7 @@ from kosis_chat.judge.schemas import Resolved, Verdict  # isort: skip  # re-expo
+ from kosis_chat.shared import defaults as default_strings  # isort: skip  # T1-28 S2b: the default_applied strings
+ from kosis_chat.shared.patterns import ASKS_PERIOD, MOST_RECENT, RANKING, UNIT_PAREN  # isort: skip
+ from kosis_chat.shared.patterns import (  # isort: skip  # loop 12: a parent named as a target (_named_apart)
+-    COUNT_WORD, JOIN_AFTER, SUBJECT_AFTER, WITHIN_AFTER, refers_after,
++    COUNT_WORD, JOIN_AFTER, SUBJECT_AFTER, WHOLE_AFTER, WITHIN_AFTER, refers_after,
+ )
+ from kosis_chat.shared.periods import period_text  # isort: skip
+ 
+@@ -150,7 +150,7 @@ def _named_apart(parsed: Parsed, matches: list, axis, parent: str, kept: set[str
+     def past_names(end: int) -> int:
+         while True:
+             nxt = next((f for f in forms if q.startswith(f, end)), None)
+-            if nxt is None and (m := COUNT_WORD.match(q[end:])):
++            if nxt is None and (m := COUNT_WORD.match(q[end:]) or WHOLE_AFTER.match(q[end:])):  # loop 13: 전체
+                 nxt = m.group(0)
+             if nxt is None:
+                 return end
+diff --git a/kosis_chat/prepare/index.py b/kosis_chat/prepare/index.py
+index 0b00fe9..5bcbd01 100644
+--- a/kosis_chat/prepare/index.py
++++ b/kosis_chat/prepare/index.py
+@@ -26,6 +26,7 @@ except ImportError:  # same fallback as judge/question.py: src/ is not on the pa
+     from kosis_ai import units
+ 
+ from kosis_chat.shared.patterns import UNIT_PAREN  # noqa: E402  (after the block above: it imports kosis_ai)
++from kosis_chat.shared.patterns import REGION_SUFFIX  # noqa: E402  # loop 13: a province's name (_link_province)
+ 
+ _UNIT_PAREN = UNIT_PAREN  # old name (T1-28 S2b: one trailing '(...)' pattern, kosis_ai.units.UNIT_PAREN)
+ _REGION_AXIS = re.compile(r"행정구역|시도|시군구|지역")
+@@ -88,7 +89,33 @@ def _link_parents(axis: Axis) -> None:
+     codes = set(axis.labels)
+     for code in axis.labels:
+         axis.parents[code] = next((code[:k] for k in range(len(code) - 1, 0, -1) if code[:k] in codes), None)
+-    _link_sections(axis)
++    if not _link_province(axis):
++        _link_sections(axis)
++
++
++def _link_province(axis: Axis) -> bool:
++    """Loop 13: a regional category of one province and its districts, whose codes are all of one length and so do
++    not nest by prefix: the first name is a province (REGION_SUFFIX: '경기도', '부산광역시'), its code is a stem padded
++    with zeros ('31000'), and every other code starts with that stem ('31010', '31020') and names no province. No name
++    is a total and no code has a parent. The districts are linked under the province (the province is then their
++    whole, as a prefix parent is). Not a category of numbered codes ('000', '005', '010': no stem left, and no province
++    name), not a list of provinces after a total (a total name), not a list of provinces alone (more than one)."""
++    codes = list(axis.labels)
++    if len(codes) < 3 or not axis.regional or any(axis.parents.get(c) is not None for c in codes):
++        return False
++    if any(is_total(label) for label in axis.labels.values()):
++        return False
++    first = codes[0]
++    stem = first.rstrip("0")
++    if not stem or stem == first or any(len(c) != len(first) for c in codes):
++        return False
++    labels = {c: _UNIT_PAREN.sub("", axis.labels[c]).strip() for c in codes}
++    if not REGION_SUFFIX.search(labels[first]) or len(REGION_SUFFIX.sub("", labels[first])) < 2:
++        return False
++    if any(not c.startswith(stem) or REGION_SUFFIX.search(labels[c]) for c in codes[1:]):
++        return False
++    axis.parents.update({c: first for c in codes[1:]})
++    return True
+ 
+ 
+ _TITLE_PAREN = re.compile(r"\([^)]*\)")
+diff --git a/kosis_chat/shared/labels.py b/kosis_chat/shared/labels.py
+index 4ee861a..d7f7f4b 100644
+--- a/kosis_chat/shared/labels.py
++++ b/kosis_chat/shared/labels.py
+@@ -59,6 +59,61 @@ def interval_forms(core: str) -> set[str]:
+     return out
+ 
+ 
++INF = float("inf")
++# Loop 13: one number of a name with its counting word and an open end ('85세이상', '5인 이상', '15세미만', '3인',
++# '65'), on the squashed name without brackets. An interval ('20-24세') is _INTERVAL's, with nothing before or after.
++_ONE_BOUND = re.compile(r"^(\d+)([가-힣]{1,2})?(이상|이하|미만|초과)?$")
++_OPEN = {"이상": (0, INF), "초과": (1, INF), "이하": (-INF, 0), "미만": (-INF, -1)}
++
++
++def label_bounds(label: str) -> tuple[float, float, str] | None:
++    """Loop 13: (low, high, counting word) of a numbered name, the one reading of a name's bounds (interval_forms
++    reads an interval's the same way, _INTERVAL): '20-24세' -> (20, 24, '세'), '5인' -> (5, 5, '인'), '85세 이상' ->
++    (85, inf, '세'), '15세미만' -> (-inf, 14, '세'), '65' -> (65, 65, ''). None for any other name."""
++    core = squash(re.sub(r"\([^()]*\)", "", UNIT_PAREN.sub("", label)))
++    m = _INTERVAL.match(core)
++    if m is not None:
++        head, low, high, unit, tail = m.groups()
++        return None if head or tail or int(low) > int(high) else (int(low), int(high), unit)
++    if m := re.match(r"^(\d+)[-~∼](\d+)$", core):  # an interval with no counting word ('0-4', '5~9')
++        return (int(m.group(1)), int(m.group(2)), "") if int(m.group(1)) <= int(m.group(2)) else None
++    m = _ONE_BOUND.match(core)
++    if m is None:
++        return None
++    n, unit, how = int(m.group(1)), m.group(2) or "", m.group(3)
++    if how is None:
++        return n, n, unit
++    lo, hi = _OPEN[how]
++    return (n + lo, INF, unit) if hi == INF else (-INF, n + hi, unit)
++
++
++# Loop 13: a range of numbers a question says, on the question as written: one bound and an open end ("65세 이상",
++# "5인 미만"), two bounds ("20세부터 34세까지", "20~34세", "10에서 49명"), a ten-year group ("20대", "60대 이상"; not
++# its halves "20대 초반", which name one interval, and not "2010년대", a period).
++_RANGE_OPEN = re.compile(r"(?<![\d.])(\d+)\s*([가-힣]{1,2}?)\s*(이상|이하|미만|초과)")
++_RANGE_TWO = re.compile(r"(?<![\d.])(\d+)\s*([가-힣]{1,2}?)?\s*(?:[-~∼]|부터|에서)\s*(\d+)\s*([가-힣]{1,2}?)"
++                        r"(?=\s*(?:까지|사이|의|은|는|이|가|을|를|에|인|와|과|및|하고|이랑|랑|[\s?.,]|$))")
++_RANGE_TENS = re.compile(r"(?<![\d.])([1-9]0)\s*대(?!\s*(?:초반|전반|중반|후반))(\s*이상)?")
++
++
++def asked_ranges(question: str) -> list[tuple[str, float, float, str]]:
++    """Loop 13: (text, low, high, counting word) of every range of numbers the question says (_RANGE_*), in question
++    order; a ten-year group counts in 세."""
++    out: list[tuple[int, str, float, float, str]] = []
++    for m in _RANGE_TWO.finditer(question):
++        unit = m.group(4) or m.group(2) or ""
++        if m.group(2) and m.group(4) and m.group(2) != m.group(4):
++            continue
++        out.append((m.start(), m.group(0), int(m.group(1)), int(m.group(3)), unit))
++    for m in _RANGE_OPEN.finditer(question):
++        n, (lo, hi) = int(m.group(1)), _OPEN[m.group(3)]
++        out.append((m.start(), m.group(0), *((n + lo, INF) if hi == INF else (-INF, n + hi)), m.group(2)))
++    for m in _RANGE_TENS.finditer(question):
++        n = int(m.group(1))
++        out.append((m.start(), m.group(0), n, INF if m.group(2) else n + 9, "세"))
++    return [o[1:] for o in sorted(out)]
++
++
+ _HOUSEHOLD = re.compile(r"\d+인(?: 이상)?")
+ 
+ 
+diff --git a/kosis_chat/shared/patterns.py b/kosis_chat/shared/patterns.py
+index dd6fb84..7a34549 100644
+--- a/kosis_chat/shared/patterns.py
++++ b/kosis_chat/shared/patterns.py
+@@ -219,6 +219,13 @@ OF_PERCENT = re.compile(r"^의몇(?:퍼센트|%|프로)")
+ JOIN_AFTER = re.compile(r"^(?:와|과|및|하고|이랑|랑|그리고|또는|,|·)")
+ # Loop 12: the subject particles after a name ("서울은", "서울이"), on the squashed question.
+ SUBJECT_AFTER = re.compile(r"^(?:은|는|이|가)")
++# Loop 13: a word of the whole said right after a name, on the squashed question ("경기도 전체 인구 중", "서울 전역",
++# "남녀 전체", "남녀 모두 합쳐서", "남녀 통틀어", "남녀를 합한"): the name's whole is meant, not a part of it. The scope
++# readings (judge _named_apart, rules _within) read past it as they read past other names; a pair named as one word
++# (rules _both_sexes) followed by it is the category's total. Words that add (합쳐, 합한) only with the adverbs or the
++# particles before them.
++WHOLE_AFTER = re.compile(r"^(?:의|을|를|이|가)?(?:전체|전역|전부|모두|통틀어|도합)"
++                         r"|^(?:을|를|이|가)?(?:모두|전부)?(?:합쳐|합친|합한|합해|합하|더한|더해)")
+ 
+ 
+ def refers_after(rest: str) -> bool:
+@@ -291,7 +298,9 @@ RANK_TOP = re.compile(
+     rf"(?:상위|하위|위에서|아래에서|밑에서|뒤에서|톱|top|TOP)\s*{_COUNT}"
+     r"|1\s*(?:위|등)?\s*(?:~|-|부터|에서)\s*(\d+)\s*(?:위|등)"
+     rf"|{_COUNT}\s*(?:위|등|번\s*째)\s*(?:까지|안|이내|권|내)"
+-    rf"|{_COUNT}\s*(?:개|곳|군데)(?!월|\s*(?:시도|지역|도시|나라|국가|항목)?\s*(?:중|가운데|에서|의))")
++    rf"|{_COUNT}\s*(?:개|곳|군데)(?!월|\s*(?:시도|지역|도시|나라|국가|항목)?\s*(?:중|가운데|에서|의)"
++    # loop 13: the count of a pool said with any noun before a word of looking inside ("4개 시 중", "다섯 개 구 가운데")
++    r"|\s*[가-힣]{1,4}\s*(?:중|가운데)(?:에서|에)?(?![가-힣]))")
+ # The periods of a series ranked: 언제, 몇 년, 어느 해, and a period word (해, 연도, 시기, 시점, 달, 분기, 때) that a
+ # describing word ends in ("가장 많았던 해", "높은 연도와", "증가한 달은"), whatever particle follows.
+ ASKS_PERIOD = re.compile(
+diff --git a/tests/loop/test_loop13_multi_ranges.py b/tests/loop/test_loop13_multi_ranges.py
+new file mode 100644
+index 0000000..e5fe64d
+--- /dev/null
++++ b/tests/loop/test_loop13_multi_ranges.py
+@@ -0,0 +1,110 @@
++"""Loop 13 B-1 over two tables (analyze/multi_rules.py _Side.ranged, _fixed_sets, _repeated, _combined).
++
++A range of numbers the question says over the numbered names of each table ("20대", "30세 미만") is one target per
++table: each table's cells are added up first, then the calculation is made between the sums (a share, a ratio, a
++difference). The same range said twice in one question ("20대 취업자는 20대 인구의") is one range.
++
++Neighbours: one interval named in both tables (the cells themselves), and the targets of a region named one by one
++(the calculation repeated per region, as before).
++
++The tables are made up (가상 데이터); every test checks the values and the cells they come from.
++"""
++
++from __future__ import annotations
++
++import re
++
++import pytest
++
++from conftest import write_table
++from kosis_chat.adapters.parquet import load_table
++from kosis_chat.calc import calculate
++from kosis_chat.schemas.resources import load_resources
++
++YEARS = ["2021", "2022", "2023"]
++AGES = (("000", "계"), ("005", "15-19세"), ("010", "20-24세"), ("015", "25-29세"), ("020", "30-34세"),
++        ("025", "35-39세"), ("030", "40세이상"))
++
++
++def _rows(item, name, unit, scale):
++    out = []
++    for y, year in enumerate(YEARS):
++        d = {c: (31 * (k + 4) + 9 * y * (k % 2 + 1)) * scale for k, (c, _) in enumerate(AGES[1:])}
++        d["000"] = sum(d.values())
++        out += [{"period": year, "item_id": item, "item_name": name, "unit": unit, "dim1_name": "연령별",
++                 "dim1_code": c, "dim1_label": l, "value_raw": str(d[c]), "value": d[c]} for c, l in AGES]
++    return out
++
++
++def catalog(title):
++    return {"survey_name": "가상 조사", "organization": "가상 기관", "table_name": title, "period": "년",
++            "url": "https://example.invalid/t"}
++
++
++SPECS = {
++    "FAKE13_EMP": (lambda: _rows("E1", "취업자", "명", 1), catalog("가상 연령별 취업자")),
++    "FAKE13_POP": (lambda: _rows("P1", "인구", "명", 2), catalog("가상 연령별 인구")),
++}
++ROWS = {t: make() for t, (make, _) in SPECS.items()}
++
++
++@pytest.fixture(scope="module")
++def res(tmp_path_factory):
++    folder = tmp_path_factory.mktemp("loop13mr") / "data"
++    return {t: load_resources(load_table(write_table(folder, t, ROWS[t], cat))) for t, (_, cat) in SPECS.items()}
++
++
++def run(res, question):
++    got = calculate(question, [res["FAKE13_EMP"], res["FAKE13_POP"]])
++    assert got.status == "ok", (got.status, got.reason, got.detail)
++    facts = {f.id: f for f in got.facts}
++    return facts, [facts[i] for i in got.answer]
++
++
++def refs_in(facts, fact):
++    out = []
++    for i in re.findall(r"f\d+", fact.derivation or ""):
++        f = facts[i]
++        out += refs_in(facts, f) if f.derivation else [f.source_ref]
++    return sorted(out)
++
++
++def total(tbl, codes, year):
++    return sum(r["value"] for r in ROWS[tbl] if r["dim1_code"] in codes and r["period"] == year)
++
++
++def refs(tbl, codes, year):
++    item = ROWS[tbl][0]["item_id"]
++    return [f"{tbl}|{item}|{c}|{year}" for c in codes]
++
++
++def last_computed(answer):
++    return [f for f in answer if not f.source_ref][-1]
++
++
++@pytest.mark.parametrize("question, codes, year", [
++    ("2023년 20대 취업자는 20대 인구의 몇 퍼센트야?", ("010", "015"), "2023"),
++    ("2021년 30세 미만 인구 중 30세 미만 취업자가 차지하는 비중은?", ("005", "010", "015"), "2021"),
++])
++def test_share_between_the_sums_of_a_range(res, question, codes, year):
++    facts, answer = run(res, question)
++    calc = last_computed(answer)
++    expect = total("FAKE13_EMP", codes, year) / total("FAKE13_POP", codes, year) * 100
++    assert calc.value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc) == sorted(refs("FAKE13_EMP", codes, year) + refs("FAKE13_POP", codes, year))
++
++
++def test_difference_between_the_sums_of_a_range(res):
++    facts, answer = run(res, "2022년 20세부터 34세까지 인구와 취업자의 차이는?")
++    calc = last_computed(answer)
++    codes = ("010", "015", "020")
++    assert abs(calc.value) == pytest.approx(total("FAKE13_POP", codes, "2022") - total("FAKE13_EMP", codes, "2022"))
++    assert refs_in(facts, calc) == sorted(refs("FAKE13_EMP", codes, "2022") + refs("FAKE13_POP", codes, "2022"))
++
++
++def test_neighbour_one_interval_in_both_tables(res):
++    facts, answer = run(res, "2023년 25-29세 취업자는 25-29세 인구의 몇 퍼센트야?")
++    calc = last_computed(answer)
++    expect = total("FAKE13_EMP", ("015",), "2023") / total("FAKE13_POP", ("015",), "2023") * 100
++    assert calc.value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc) == sorted(refs("FAKE13_EMP", ("015",), "2023") + refs("FAKE13_POP", ("015",), "2023"))
+diff --git a/tests/loop/test_loop13_multi_whole.py b/tests/loop/test_loop13_multi_whole.py
+new file mode 100644
+index 0000000..a7a4f29
+--- /dev/null
++++ b/tests/loop/test_loop13_multi_whole.py
+@@ -0,0 +1,107 @@
++"""Loop 13 F-1 (analyze/multi_rules.py _assign_items): two tables, one of whose items the question does not name.
++
++One table counts a whole group with no mark ('취업자' over its industries: the index links them, loop 11), the other
++a part of the same group. The question names the part's table by its item and the other only by a word of the whole
++and a word of looking inside. The unnamed table is asked at its whole item (rules._total), when the other table's item
++is named, as the one-table rules fill an unnamed category.
++
++Neighbours: a table of different measures (no whole: still no plan), and no table's item named (nothing filled).
++
++The tables are made up (가상 데이터); every test checks the values and the cells they come from.
++"""
++
++from __future__ import annotations
++
++import re
++
++import pytest
++
++from conftest import write_table
++from kosis_chat.adapters.parquet import load_table
++from kosis_chat.calc import calculate
++from kosis_chat.schemas.resources import load_resources
++
++YEARS = ["2021", "2022", "2023"]
++PROVINCES = (("11", "서울특별시"), ("26", "부산광역시"))
++INDUSTRY = (("E0", "취업자"), ("E1", "농림어업"), ("E2", "제조업"), ("E3", "서비스업"))
++RATES = (("R1", "고용률"), ("R2", "실업률"), ("R3", "경제활동참가율"))
++
++
++def industry_rows():
++    out = []
++    for y, year in enumerate(YEARS):
++        for r, (code, label) in enumerate(PROVINCES):
++            d = [40 + y + 20 * r, 400 + 7 * y - 30 * r, 900 + 13 * y - 70 * r]
++            out += [{"period": year, "item_id": c, "item_name": n, "unit": "천명", "dim1_name": "시도별",
++                     "dim1_code": code, "dim1_label": label, "value_raw": str(v), "value": v}
++                    for (c, n), v in zip(INDUSTRY, [sum(d), *d])]
++    return out
++
++
++def youth_rows():
++    return [{"period": year, "item_id": "Y1", "item_name": "청년취업자", "unit": "천명", "dim1_name": "시도별",
++             "dim1_code": code, "dim1_label": label, "value_raw": str(v), "value": v}
++            for y, year in enumerate(YEARS) for r, (code, label) in enumerate(PROVINCES)
++            for v in [210 + 5 * y - 40 * r]]
++
++
++def rate_rows():
++    return [{"period": year, "item_id": c, "item_name": n, "unit": "%", "dim1_name": "시도별", "dim1_code": code,
++             "dim1_label": label, "value_raw": str(v), "value": v}
++            for y, year in enumerate(YEARS) for code, label in PROVINCES
++            for k, (c, n) in enumerate(RATES) for v in [round(60.5 - 20 * k + y * 0.3, 1)]]
++
++
++def catalog(title):
++    return {"survey_name": "가상 조사", "organization": "가상 기관", "table_name": title, "period": "년",
++            "url": "https://example.invalid/t"}
++
++
++SPECS = {
++    "FAKE13_IND": (industry_rows, catalog("가상 시도별 산업별 취업자")),
++    "FAKE13_YTH": (youth_rows, catalog("가상 시도별 청년취업자")),
++    "FAKE13_RATE": (rate_rows, catalog("가상 시도별 고용 지표")),
++}
++ROWS = {t: make() for t, (make, _) in SPECS.items()}
++
++
++@pytest.fixture(scope="module")
++def res(tmp_path_factory):
++    folder = tmp_path_factory.mktemp("loop13m") / "data"
++    return {t: load_resources(load_table(write_table(folder, t, ROWS[t], cat))) for t, (_, cat) in SPECS.items()}
++
++
++def refs_in(facts, fact):
++    out = []
++    for i in re.findall(r"f\d+", fact.derivation or ""):
++        f = facts[i]
++        out += refs_in(facts, f) if f.derivation else [f.source_ref]
++    return sorted(out)
++
++
++def value(tbl, item, code, year):
++    return next(r["value"] for r in ROWS[tbl] if r["dim1_code"] == code and r["period"] == year and r["item_id"] == item)
++
++
++@pytest.mark.parametrize("question, code, year", [
++    ("2023년 서울에서 청년취업자가 전체에서 차지하는 비중은?", "11", "2023"),
++    ("2021년 부산은 전체 가운데 청년취업자가 몇 퍼센트야?", "26", "2021"),
++])
++def test_share_over_the_unnamed_table_whole(res, question, code, year):
++    got = calculate(question, [res["FAKE13_YTH"], res["FAKE13_IND"]])
++    assert got.status == "ok", (got.status, got.reason, got.detail)
++    facts = {f.id: f for f in got.facts}
++    calc = [facts[i] for i in got.answer if not facts[i].source_ref]
++    expect = value("FAKE13_YTH", "Y1", code, year) / value("FAKE13_IND", "E0", code, year) * 100
++    assert len(calc) == 1 and calc[0].value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted([f"FAKE13_YTH|Y1|{code}|{year}", f"FAKE13_IND|E0|{code}|{year}"])
++
++
++def test_neighbour_table_of_different_measures_stays_open(res):
++    got = calculate("2023년 서울에서 청년취업자가 전체에서 차지하는 비중은?", [res["FAKE13_YTH"], res["FAKE13_RATE"]])
++    assert got.status != "ok"
++
++
++def test_neighbour_no_item_named_fills_nothing(res):
++    got = calculate("2023년 서울에서 전체 중 차지하는 비중은?", [res["FAKE13_IND"], res["FAKE13_RATE"]])
++    assert got.status != "ok"
+diff --git a/tests/loop/test_loop13_number_ranges.py b/tests/loop/test_loop13_number_ranges.py
+new file mode 100644
+index 0000000..88d80e2
+--- /dev/null
++++ b/tests/loop/test_loop13_number_ranges.py
+@@ -0,0 +1,161 @@
++"""Loop 13 B-1 (shared/labels.py label_bounds, asked_ranges; analyze/rules.py _number_range, _cover, _operation).
++
++A range of numbers the question says over several numbered names of one category: a ten-year group ("20대") over
++five-year intervals, one bound with an open end ("50명 이상", "30세 미만") over intervals, single numbers and an open
++last name, two bounds wider than one name ("20세부터 34세까지"). The names the range covers end to end are one
++target: their sum for a value (no word that adds them is needed), the part for a share. The counting word is read from
++the category's names, some of which carry a number only.
++
++Neighbours: one interval or half of a ten-year group named (its cell alone), two intervals named one by one and added,
++an open name with the asked bound (its cell alone), a range whose bounds fall inside a name (no plan, as before), the
++lower bound of the group the table counts said in its title (not a range), a range of years (a period).
++
++The tables are made up (가상 데이터); every test checks the values and the cells they come from.
++"""
++
++from __future__ import annotations
++
++import re
++
++import pytest
++
++from conftest import write_table
++from kosis_chat.adapters.parquet import load_table
++from kosis_chat.calc import calculate
++from kosis_chat.schemas.resources import load_resources
++
++YEARS = ["2021", "2022", "2023"]
++# 연령: a total, five-year intervals (the first ones with no counting word) and an open last name
++AGES = (("000", "계"), ("005", "15-19"), ("010", "20-24"), ("015", "25-29세"), ("020", "30-34세"), ("025", "35-39세"),
++        ("030", "40-49세"), ("035", "50세 이상"))
++# 종사자 규모: single numbers, intervals and an open end, counted in 명
++SIZES = (("S0", "전체"), ("S1", "1명"), ("S2", "2-4명"), ("S3", "5-9명"), ("S4", "10-49명"), ("S5", "50-99명"),
++         ("S6", "100명이상"))
++
++
++def _rows(tbl, item, name, unit, dim, labels, year_scale):
++    out = []
++    for y, year in enumerate(YEARS):
++        d = {c: (37 * (k + 3) + 11 * y * (k % 3 + 1)) * year_scale for k, (c, _) in enumerate(labels[1:])}
++        d[labels[0][0]] = sum(d.values())
++        out += [{"period": year, "item_id": item, "item_name": name, "unit": unit, "dim1_name": dim, "dim1_code": c,
++                 "dim1_label": l, "value_raw": str(d[c]), "value": d[c]} for c, l in labels]
++    return out
++
++
++def catalog(title):
++    return {"survey_name": "가상 조사", "organization": "가상 기관", "table_name": title, "period": "년",
++            "url": "https://example.invalid/t"}
++
++
++SPECS = {
++    "FAKE13_AGE": (lambda: _rows("FAKE13_AGE", "E1", "취업자", "천명", "연령별", AGES, 1),
++                   catalog("가상 연령별 15세 이상 취업자")),
++    "FAKE13_SZ": (lambda: _rows("FAKE13_SZ", "B1", "사업체수", "개", "종사자규모별", SIZES, 3),
++                  catalog("가상 종사자규모별 사업체수")),
++}
++ROWS = {t: make() for t, (make, _) in SPECS.items()}
++
++
++@pytest.fixture(scope="module")
++def res(tmp_path_factory):
++    folder = tmp_path_factory.mktemp("loop13r") / "data"
++    return {t: load_resources(load_table(write_table(folder, t, ROWS[t], cat))) for t, (_, cat) in SPECS.items()}
++
++
++def ask(res, question, tbl):
++    got = calculate(question, [res[tbl]])
++    assert got.status == "ok", (got.status, got.reason, got.detail)
++    facts = {f.id: f for f in got.facts}
++    return facts, [facts[i] for i in got.answer]
++
++
++def refs_in(facts, fact):
++    out = []
++    for i in re.findall(r"f\d+", fact.derivation or ""):
++        f = facts[i]
++        out += refs_in(facts, f) if f.derivation else [f.source_ref]
++    return sorted(out)
++
++
++def value(tbl, code, year):
++    return next(r["value"] for r in ROWS[tbl] if r["dim1_code"] == code and r["period"] == year)
++
++
++def ref(tbl, code, year):
++    return f"{tbl}|{ROWS[tbl][0]['item_id']}|{code}|{year}"
++
++
++def computed(answer):
++    return [f for f in answer if not f.source_ref]
++
++
++# ---------------------------------------------------------------- the sum of the names a range covers
++
++
++@pytest.mark.parametrize("question, tbl, codes, year", [
++    ("2023년 20대 취업자는 몇 명이야?", "FAKE13_AGE", ("010", "015"), "2023"),
++    ("2022년 30세 미만 취업자 수 알려줘", "FAKE13_AGE", ("005", "010", "015"), "2022"),
++    ("2021년 20세부터 34세까지 취업자는?", "FAKE13_AGE", ("010", "015", "020"), "2021"),
++    ("2023년 종사자 50명 이상 사업체는 몇 개야?", "FAKE13_SZ", ("S5", "S6"), "2023"),
++    ("2022년 종사자가 10명 미만인 사업체 수는?", "FAKE13_SZ", ("S1", "S2", "S3"), "2022"),
++])
++def test_value_of_a_range_is_the_sum_of_its_names(res, question, tbl, codes, year):
++    facts, answer = ask(res, question, tbl)
++    calc = computed(answer)
++    assert len(calc) == 1
++    assert calc[0].value == pytest.approx(sum(value(tbl, c, year) for c in codes), abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted(ref(tbl, c, year) for c in codes)
++
++
++@pytest.mark.parametrize("question, tbl, codes, whole, year", [
++    ("2023년 전체 취업자 중 20대가 차지하는 비중은?", "FAKE13_AGE", ("010", "015"), "000", "2023"),
++    ("2021년 종사자 50명 이상 사업체가 전체 사업체에서 차지하는 비중은?", "FAKE13_SZ", ("S5", "S6"), "S0", "2021"),
++])
++def test_share_of_a_range(res, question, tbl, codes, whole, year):
++    facts, answer = ask(res, question, tbl)
++    calc = computed(answer)
++    expect = sum(value(tbl, c, year) for c in codes) / value(tbl, whole, year) * 100
++    shares = [f for f in calc if "*" in (f.derivation or "")]
++    assert shares and shares[-1].value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, shares[-1]) == sorted(ref(tbl, c, year) for c in (*codes, whole))
++
++
++# ---------------------------------------------------------------- neighbours
++
++
++@pytest.mark.parametrize("question, tbl, code, year", [
++    ("2023년 25-29세 취업자는?", "FAKE13_AGE", "015", "2023"),
++    ("2022년 20대 후반 취업자는?", "FAKE13_AGE", "015", "2022"),
++    ("2023년 50세 이상 취업자는?", "FAKE13_AGE", "035", "2023"),
++    ("2021년 종사자 100명 이상 사업체 수는?", "FAKE13_SZ", "S6", "2021"),
++])
++def test_neighbour_one_name_is_its_cell(res, question, tbl, code, year):
++    _, answer = ask(res, question, tbl)
++    assert [f.source_ref for f in answer] == [ref(tbl, code, year)]
++
++
++def test_neighbour_two_intervals_named_one_by_one_and_added(res):
++    facts, answer = ask(res, "2023년 30-34세와 35-39세 취업자를 합하면?", "FAKE13_AGE")
++    calc = computed(answer)
++    assert calc[0].value == pytest.approx(value("FAKE13_AGE", "020", "2023") + value("FAKE13_AGE", "025", "2023"))
++    assert refs_in(facts, calc[0]) == sorted([ref("FAKE13_AGE", "020", "2023"), ref("FAKE13_AGE", "025", "2023")])
++
++
++def test_neighbour_range_inside_a_name_is_not_picked(res):
++    got = calculate("2023년 30세부터 45세까지 취업자는?", [res["FAKE13_AGE"]])
++    assert got.status != "ok" or all(f.source_ref != ref("FAKE13_AGE", "000", "2023") for f in got.facts) is False \
++        or not any(f.source_ref in {ref("FAKE13_AGE", c, "2023") for c in ("020", "025")} for f in got.facts)
++
++
++def test_neighbour_title_bound_is_the_whole(res):
++    """'15세 이상' is the group the table counts (its title): the total, not the open name above it."""
++    _, answer = ask(res, "2023년 15세 이상 취업자는?", "FAKE13_AGE")
++    assert [f.source_ref for f in answer] == [ref("FAKE13_AGE", "000", "2023")]
++
++
++def test_neighbour_year_range_is_a_period(res):
++    facts, answer = ask(res, "2021~2023년 20-24세 취업자 평균은?", "FAKE13_AGE")
++    calc = computed(answer)
++    assert calc[0].value == pytest.approx(sum(value("FAKE13_AGE", "010", y) for y in YEARS) / 3, abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted(ref("FAKE13_AGE", "010", y) for y in YEARS)
+diff --git a/tests/loop/test_loop13_province_table.py b/tests/loop/test_loop13_province_table.py
+new file mode 100644
+index 0000000..4af7eec
+--- /dev/null
++++ b/tests/loop/test_loop13_province_table.py
+@@ -0,0 +1,174 @@
++"""Loop 13 A-1 (prepare/index.py _link_province): a table of one province and its districts.
++
++The regional category's first name is one province ('경기도', '부산광역시'; the title starts with it), the others are
++its districts. There is no total name and the codes are all of one length ('31000', '31010', '31020'), so they do not
++nest by prefix. The index links the districts under the province: a district named after its province is the only
++target, and the province is the whole when no region is named.
++
++Neighbours: a category of provinces after a total stays as it was (the provinces are the candidates of a ranking), and
++a category of numbered codes padded with zeros ('100', '110', '120') is not linked.
++
++The tables are made up (가상 데이터); every test checks the values and the cells they come from.
++"""
++
++from __future__ import annotations
++
++import re
++
++import pytest
++
++from conftest import write_table
++from kosis_chat.adapters.parquet import load_table
++from kosis_chat.calc import calculate
++from kosis_chat.schemas.resources import load_resources
++
++YEARS = ["2020", "2021", "2022", "2023"]
++GG = (("31000", "경기도"), ("31010", "수원시"), ("31020", "성남시"), ("31030", "고양시"), ("31040", "용인시"))
++BS = (("26000", "부산광역시"), ("26010", "중구"), ("26020", "서구"), ("26030", "해운대구"))
++NATION = (("00", "전국"), ("11", "서울특별시"), ("21", "부산광역시"), ("22", "대구광역시"))
++
++
++def _rows(item, name, unit, dim, regions, base):
++    out = []
++    for y, year in enumerate(YEARS):
++        d = {c: base[k] + (k + 2) * y * 7 for k, (c, _) in enumerate(regions[1:])}
++        d[regions[0][0]] = sum(d.values())
++        out += [{"period": year, "item_id": item, "item_name": name, "unit": unit, "dim1_name": dim, "dim1_code": c,
++                 "dim1_label": l, "value_raw": str(d[c]), "value": d[c]} for c, l in regions]
++    return out
++
++
++def catalog(title):
++    return {"survey_name": "가상 조사", "organization": "가상 기관", "table_name": title, "period": "년",
++            "url": "https://example.invalid/t"}
++
++
++SPECS = {
++    "FAKE13_GG": (lambda: _rows("T1", "인구", "명", "시군구별", GG, [1200, 900, 1050, 1100]),
++                  catalog("경기도 시군구별 인구")),
++    "FAKE13_BS": (lambda: _rows("B1", "사업체수", "개", "행정구역별", BS, [300, 410, 820]),
++                  catalog("부산광역시 구군별 사업체수")),
++    "FAKE13_NA": (lambda: _rows("P1", "인구", "천명", "시도별", NATION, [9400, 3300, 2400]),
++                  catalog("가상 시도별 인구")),
++}
++ROWS = {t: make() for t, (make, _) in SPECS.items()}
++
++
++@pytest.fixture(scope="module")
++def res(tmp_path_factory):
++    folder = tmp_path_factory.mktemp("loop13p") / "data"
++    return {t: load_resources(load_table(write_table(folder, t, ROWS[t], cat))) for t, (_, cat) in SPECS.items()}
++
++
++def ask(res, question, tbl):
++    got = calculate(question, [res[tbl]])
++    assert got.status == "ok", (got.status, got.reason, got.detail)
++    facts = {f.id: f for f in got.facts}
++    return facts, [facts[i] for i in got.answer]
++
++
++def refs_in(facts, fact):
++    out = []
++    for i in re.findall(r"f\d+", fact.derivation or ""):
++        f = facts[i]
++        out += refs_in(facts, f) if f.derivation else [f.source_ref]
++    return sorted(out)
++
++
++def value(tbl, code, year):
++    return next(r["value"] for r in ROWS[tbl] if r["dim1_code"] == code and r["period"] == year)
++
++
++def ref(tbl, code, year):
++    return f"{tbl}|{ROWS[tbl][0]['item_id']}|{code}|{year}"
++
++
++def cells(answer):
++    return sorted(f.source_ref for f in answer if f.source_ref)
++
++
++def computed(answer):
++    return [f for f in answer if not f.source_ref]
++
++
++# ---------------------------------------------------------------- the index
++
++
++@pytest.mark.parametrize("tbl, first", [("FAKE13_GG", "31000"), ("FAKE13_BS", "26000")])
++def test_districts_are_linked_under_the_province(res, tbl, first):
++    from kosis_chat.prepare.index import index_of
++
++    axis = next(a for n, a in index_of(res[tbl].table).axes.items() if a.regional)
++    assert axis.parents[first] is None
++    assert all(axis.parents[c] == first for c in axis.labels if c != first)
++
++
++# ---------------------------------------------------------------- a district named after its province
++
++
++@pytest.mark.parametrize("question, tbl, code, year", [
++    ("2023년 경기도 수원시 인구는?", "FAKE13_GG", "31010", "2023"),
++    ("2021년 부산 해운대구 사업체 수 알려줘", "FAKE13_BS", "26030", "2021"),
++])
++def test_value_of_a_district_after_its_province(res, question, tbl, code, year):
++    _, answer = ask(res, question, tbl)
++    assert cells(answer) == [ref(tbl, code, year)]
++    assert answer[0].value == value(tbl, code, year)
++
++
++@pytest.mark.parametrize("question, tbl, code, early, late", [
++    ("2020년부터 2023년까지 경기도 성남시 인구는 몇 명 늘었어?", "FAKE13_GG", "31020", "2020", "2023"),
++    ("2021년 대비 2022년 부산광역시 서구 사업체수는 얼마나 늘었어?", "FAKE13_BS", "26020", "2021", "2022"),
++])
++def test_change_of_a_district_after_its_province(res, question, tbl, code, early, late):
++    facts, answer = ask(res, question, tbl)
++    assert cells(answer) == sorted([ref(tbl, code, early), ref(tbl, code, late)])
++    amounts = [f for f in computed(answer) if "/" not in (f.derivation or "")]
++    assert amounts and amounts[0].value == pytest.approx(value(tbl, code, late) - value(tbl, code, early), abs=0.01)
++    assert refs_in(facts, amounts[0]) == sorted([ref(tbl, code, early), ref(tbl, code, late)])
++
++
++@pytest.mark.parametrize("question, tbl, a, b, year", [
++    ("2022년 경기도 고양시와 용인시 인구 차이는?", "FAKE13_GG", "31030", "31040", "2022"),
++    ("2023년 부산 중구와 해운대구의 사업체수 차이는 얼마야?", "FAKE13_BS", "26010", "26030", "2023"),
++])
++def test_difference_of_two_districts_after_their_province(res, question, tbl, a, b, year):
++    facts, answer = ask(res, question, tbl)
++    calc = computed(answer)
++    assert len(calc) == 1
++    assert refs_in(facts, calc[0]) == sorted([ref(tbl, a, year), ref(tbl, b, year)])
++    assert abs(calc[0].value) == pytest.approx(abs(value(tbl, a, year) - value(tbl, b, year)), abs=0.01)
++    assert cells(answer) == sorted([ref(tbl, a, year), ref(tbl, b, year)])
++
++
++@pytest.mark.parametrize("question, tbl, code, year", [
++    ("2023년 인구는 몇 명이야?", "FAKE13_GG", "31000", "2023"),
++    ("2020년 사업체수 알려줘", "FAKE13_BS", "26000", "2020"),
++])
++def test_no_region_named_is_the_province(res, question, tbl, code, year):
++    _, answer = ask(res, question, tbl)
++    assert cells(answer) == [ref(tbl, code, year)]
++
++
++# ---------------------------------------------------------------- neighbours
++
++
++def test_neighbour_provinces_after_a_total_are_candidates(res):
++    _, answer = ask(res, "2023년 인구가 가장 많은 시도는?", "FAKE13_NA")
++    assert cells(answer) == [ref("FAKE13_NA", "11", "2023")]
++
++
++def test_neighbour_province_and_district_side_by_side(res):
++    _, answer = ask(res, "2023년 경기도와 수원시 인구를 각각 알려줘", "FAKE13_GG")
++    assert cells(answer) == sorted([ref("FAKE13_GG", "31000", "2023"), ref("FAKE13_GG", "31010", "2023")])
++
++
++def test_neighbour_numbered_codes_are_not_linked(tmp_path):
++    """Codes padded with zeros that count (a regional category of numbered places) and no province name."""
++    from kosis_chat.prepare.index import index_of
++
++    regions = (("100", "제1구역"), ("110", "제2구역"), ("120", "제3구역"))
++    rows = _rows("Z1", "인구", "명", "지역별", regions, [10, 20])
++    table = load_resources(load_table(write_table(tmp_path / "data", "FAKE13_ZN", rows, catalog("가상 지역별 인구")))).table
++    axis = next(a for a in index_of(table).axes.values() if a.regional)
++    assert all(p is None for p in axis.parents.values())
+diff --git a/tests/loop/test_loop13_scope_words.py b/tests/loop/test_loop13_scope_words.py
+new file mode 100644
+index 0000000..88c9bc3
+--- /dev/null
++++ b/tests/loop/test_loop13_scope_words.py
+@@ -0,0 +1,256 @@
++"""Loop 13 A-2 and A-3 (analyze/rules.py _within, _scope; judge/rules.py _named_apart; shared WHOLE_AFTER, RANK_TOP).
++
++A-2: a share whose whole is a region said with a word of the whole and the item before the word of looking inside
++("서울 전체 인구 중 종로구가 차지하는 비중"). The scope readings read past the word of the whole (shared WHOLE_AFTER) as
++they read past other names, so the region is the whole, not the category's total.
++
++A-3: a ranking inside a region whose members are said by their count and unit noun before the word of looking inside
++("서울의 3개 구 중"), or by the unit noun as the candidates' noun with no such word ("부산에서 가구가 가장 많은 구는").
++The unit noun is read from the table: the letters the members' names end with (_member_ends).
++
++Neighbours: an item named alone before the word of looking inside with a part of another category (the total of the
++category is the whole), a region fixed and another category's noun as the candidates, a region fixed and the periods
++ranked, a region with no members, and the first n places said by a count with no pool.
++
++The tables are made up (가상 데이터); every test checks the values and the cells they come from.
++"""
++
++from __future__ import annotations
++
++import re
++
++import pytest
++
++from conftest import write_table
++from kosis_chat.adapters.parquet import load_table
++from kosis_chat.calc import calculate
++from kosis_chat.schemas.resources import load_resources
++
++YEARS = ["2020", "2021", "2022", "2023"]
++REGIONS = (("00", "전국"), ("11", "서울특별시"), ("11010", "종로구"), ("11020", "용산구"), ("11030", "마포구"),
++           ("26", "부산광역시"), ("26010", "해운대구"), ("26020", "수영구"), ("26030", "동래구"), ("36", "세종특별자치시"))
++ITEMS = (("T1", "인구", "명", 1), ("T2", "가구", "가구", 0.4))
++SEXES = (("0", "계"), ("1", "남자"), ("2", "여자"))
++
++
++def _district(y):
++    return {"11010": 150 + y, "11020": 230 - 2 * y, "11030": 370 + 3 * y, "26010": 410 - y, "26020": 170 + 2 * y,
++            "26030": 300 + 5 * y}
++
++
++def region_rows():
++    out = []
++    for y, year in enumerate(YEARS):
++        for item, name, unit, scale in ITEMS:
++            d = {k: round(v * scale) for k, v in _district(y).items()}
++            d["11"] = d["11010"] + d["11020"] + d["11030"]
++            d["26"] = d["26010"] + d["26020"] + d["26030"]
++            d["36"] = round((90 + 4 * y) * scale)
++            d["00"] = d["11"] + d["26"] + d["36"]
++            out += [{"period": year, "item_id": item, "item_name": name, "unit": unit, "dim1_name": "행정구역별",
++                     "dim1_code": c, "dim1_label": l, "value_raw": str(d[c]), "value": d[c]} for c, l in REGIONS]
++    return out
++
++
++def sex_rows():
++    """인구 by 시도 (the regions above) and 성별: a second category of parts."""
++    out = []
++    for y, year in enumerate(YEARS):
++        d = _district(y)
++        for c, l in REGIONS:
++            if c in d:
++                total = d[c]
++            elif c == "11":
++                total = d["11010"] + d["11020"] + d["11030"]
++            elif c == "26":
++                total = d["26010"] + d["26020"] + d["26030"]
++            elif c == "36":
++                total = 90 + 4 * y
++            else:
++                total = sum(d.values()) + 90 + 4 * y
++            male = total * 49 // 100
++            for (sc, sl), v in zip(SEXES, (total, male, total - male), strict=True):
++                out.append({"period": year, "item_id": "T1", "item_name": "인구", "unit": "명",
++                            "dim1_name": "행정구역별", "dim1_code": c, "dim1_label": l, "dim2_name": "성별",
++                            "dim2_code": sc, "dim2_label": sl, "value_raw": str(v), "value": v})
++    return out
++
++
++def catalog(title):
++    return {"survey_name": "가상 조사", "organization": "가상 기관", "table_name": title, "period": "년",
++            "url": "https://example.invalid/t"}
++
++
++SPECS = {
++    "FAKE13_RG": (region_rows, catalog("가상 행정구역별 인구와 가구")),
++    "FAKE13_SX": (sex_rows, catalog("가상 행정구역별 성별 인구")),
++}
++ROWS = {t: make() for t, (make, _) in SPECS.items()}
++
++
++@pytest.fixture(scope="module")
++def res(tmp_path_factory):
++    folder = tmp_path_factory.mktemp("loop13s") / "data"
++    return {t: load_resources(load_table(write_table(folder, t, ROWS[t], cat))) for t, (_, cat) in SPECS.items()}
++
++
++def ask(res, question, tbl):
++    got = calculate(question, [res[tbl]])
++    assert got.status == "ok", (got.status, got.reason, got.detail)
++    facts = {f.id: f for f in got.facts}
++    return facts, [facts[i] for i in got.answer]
++
++
++def refs_in(facts, fact):
++    out = []
++    for i in re.findall(r"f\d+", fact.derivation or ""):
++        f = facts[i]
++        out += refs_in(facts, f) if f.derivation else [f.source_ref]
++    return sorted(out)
++
++
++def value(tbl, item, code, year, sex=None):
++    return next(r["value"] for r in ROWS[tbl] if r["dim1_code"] == code and r["period"] == year
++                and r["item_id"] == item and (sex is None or r.get("dim2_code") == sex))
++
++
++def ref(tbl, item, code, year, sex=None):
++    return f"{tbl}|{item}|{code}|{year}" if sex is None else f"{tbl}|{item}|{code}|{sex}|{year}"
++
++
++def cells(answer):
++    return sorted(f.source_ref for f in answer if f.source_ref)
++
++
++def computed(answer):
++    return [f for f in answer if not f.source_ref]
++
++
++# ---------------------------------------------------------------- A-2: the region's whole as a share's whole
++
++
++@pytest.mark.parametrize("question, item, part, whole, year", [
++    ("2023년 서울 전체 인구 중 종로구가 차지하는 비중은?", "T1", "11010", "11", "2023"),
++    ("2021년 부산광역시 전체 가구 가운데 수영구 가구의 비중은 얼마야?", "T2", "26020", "26", "2021"),
++])
++def test_share_of_a_district_in_its_whole_province(res, question, item, part, whole, year):
++    facts, answer = ask(res, question, "FAKE13_RG")
++    calc = computed(answer)
++    assert len(calc) == 1
++    expect = value("FAKE13_RG", item, part, year) / value("FAKE13_RG", item, whole, year) * 100
++    assert calc[0].value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted([ref("FAKE13_RG", item, part, year), ref("FAKE13_RG", item, whole, year)])
++
++
++def test_share_change_of_a_district_in_its_whole_province(res):
++    facts, answer = ask(res, "2020년과 2023년 사이 서울 전체 인구 중 마포구가 차지하는 비중은 얼마나 변했어?", "FAKE13_RG")
++    calc = computed(answer)
++    shares = [round(value("FAKE13_RG", "T1", "11030", y) / value("FAKE13_RG", "T1", "11", y) * 100, 2)
++              for y in ("2020", "2023")]
++    assert sorted(round(f.value, 2) for f in calc if "*" in (f.derivation or "")) == sorted(shares)
++    used = sorted({r for f in calc for r in refs_in(facts, f)})
++    assert used == sorted(ref("FAKE13_RG", "T1", c, y) for c in ("11", "11030") for y in ("2020", "2023"))
++
++
++def test_neighbour_item_alone_before_the_scope_word(res):
++    """"인구 중 여자" with no region whole: the share of the sex in the region's 인구 (the sex category's total)."""
++    facts, answer = ask(res, "2022년 서울 인구 중 여자가 차지하는 비중은?", "FAKE13_SX")
++    calc = computed(answer)
++    expect = value("FAKE13_SX", "T1", "11", "2022", "2") / value("FAKE13_SX", "T1", "11", "2022", "0") * 100
++    assert calc[0].value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted([ref("FAKE13_SX", "T1", "11", "2022", "0"),
++                                              ref("FAKE13_SX", "T1", "11", "2022", "2")])
++
++
++def test_neighbour_district_share_with_no_province_named(res):
++    facts, answer = ask(res, "2023년 전국 인구 중 해운대구가 차지하는 비중은?", "FAKE13_RG")
++    calc = computed(answer)
++    expect = value("FAKE13_RG", "T1", "26010", "2023") / value("FAKE13_RG", "T1", "00", "2023") * 100
++    assert calc[0].value == pytest.approx(round(expect, 2), abs=0.01)
++
++
++# ---------------------------------------------------------------- A-3: a ranking inside a region
++
++
++@pytest.mark.parametrize("question, item, code, year", [
++    ("2023년 서울의 3개 구 중 인구가 가장 많은 곳은?", "T1", "11030", "2023"),
++    ("2020년 부산의 세 개 구 가운데 가구가 가장 적은 곳은?", "T2", "26020", "2020"),
++    ("2022년 부산에서 가구가 가장 많은 구는?", "T2", "26010", "2022"),
++    ("2021년 서울에서 인구가 제일 적은 구는 어디야?", "T1", "11010", "2021"),
++])
++def test_ranking_among_the_districts_of_a_province(res, question, item, code, year):
++    _, answer = ask(res, question, "FAKE13_RG")
++    assert cells(answer) == [ref("FAKE13_RG", item, code, year)]
++    assert answer[0].value == value("FAKE13_RG", item, code, year)
++
++
++def test_neighbour_region_fixed_and_another_category_ranked(res):
++    _, answer = ask(res, "2023년 부산에서 인구가 가장 많은 성별은?", "FAKE13_SX")
++    assert cells(answer) == [ref("FAKE13_SX", "T1", "26", "2023", "2")]
++
++
++def test_neighbour_region_fixed_and_the_periods_ranked(res):
++    _, answer = ask(res, "서울 인구가 가장 많았던 해는?", "FAKE13_RG")
++    best = max(YEARS, key=lambda y: value("FAKE13_RG", "T1", "11", y))
++    assert cells(answer) == [ref("FAKE13_RG", "T1", "11", best)]
++
++
++def test_neighbour_first_places_by_a_count_with_no_pool(res):
++    _, answer = ask(res, "2023년 인구가 가장 많은 2개 시도는?", "FAKE13_RG")
++    assert cells(answer) == sorted([ref("FAKE13_RG", "T1", "11", "2023"), ref("FAKE13_RG", "T1", "26", "2023")])
++
++
++# ---------------------------------------------------------------- C-1: the two sexes as one word with a word of the whole
++
++
++def _best(year, pick):
++    provinces = ("11", "26", "36")
++    return pick(provinces, key=lambda c: value("FAKE13_SX", "T1", c, year, "0"))
++
++
++@pytest.mark.parametrize("question, year, pick", [
++    ("2023년 남녀 전체로 봤을 때 인구가 가장 많은 시도는?", "2023", max),
++    ("2021년 남녀를 합쳐서 인구가 가장 적은 시도는?", "2021", min),
++])
++def test_ranking_with_both_sexes_as_the_whole(res, question, year, pick):
++    _, answer = ask(res, question, "FAKE13_SX")
++    code = _best(year, pick)
++    assert cells(answer) == [ref("FAKE13_SX", "T1", code, year, "0")]
++
++
++@pytest.mark.parametrize("question, code, year", [
++    ("2022년 서울의 남녀 전체 인구는?", "11", "2022"),
++    ("2020년 부산의 성별 전체 인구는 몇 명이야?", "26", "2020"),
++])
++def test_value_with_both_sexes_as_the_whole_is_the_total_cell(res, question, code, year):
++    _, answer = ask(res, question, "FAKE13_SX")
++    assert [f.source_ref for f in answer] == [ref("FAKE13_SX", "T1", code, year, "0")]
++
++
++def test_neighbour_both_sexes_each(res):
++    _, answer = ask(res, "2022년 서울의 남녀 인구를 각각 알려줘", "FAKE13_SX")
++    assert cells(answer) == sorted(ref("FAKE13_SX", "T1", "11", "2022", s) for s in ("1", "2"))
++
++
++def test_neighbour_both_sexes_difference(res):
++    facts, answer = ask(res, "2023년 부산의 남녀 인구 차이는?", "FAKE13_SX")
++    calc = computed(answer)
++    assert len(calc) == 1
++    assert abs(calc[0].value) == pytest.approx(abs(value("FAKE13_SX", "T1", "26", "2023", "2")
++                                                   - value("FAKE13_SX", "T1", "26", "2023", "1")))
++    assert refs_in(facts, calc[0]) == sorted(ref("FAKE13_SX", "T1", "26", "2023", s) for s in ("1", "2"))
++
++
++@pytest.mark.parametrize("question, code, sex, year", [
++    ("2023년 서울 남녀 전체 인구 중 여자가 차지하는 비중은?", "11", "2", "2023"),
++    ("2021년 부산의 남녀 전체 인구 가운데 남자 비중은?", "26", "1", "2021"),
++])
++def test_neighbour_one_sex_named_apart_is_the_part_of_the_region_whole(res, question, code, sex, year):
++    """The two sexes with a word of the whole and one sex named apart: the sex is the part, the region's total the
++    whole (the pair word is read past as a name when the region is the group looked inside)."""
++    facts, answer = ask(res, question, "FAKE13_SX")
++    calc = computed(answer)
++    expect = value("FAKE13_SX", "T1", code, year, sex) / value("FAKE13_SX", "T1", code, year, "0") * 100
++    assert len(calc) == 1 and calc[0].value == pytest.approx(round(expect, 2), abs=0.01)
++    assert refs_in(facts, calc[0]) == sorted([ref("FAKE13_SX", "T1", code, year, sex),
++                                              ref("FAKE13_SX", "T1", code, year, "0")])
