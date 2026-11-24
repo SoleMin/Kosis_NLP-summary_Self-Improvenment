@@ -4,6 +4,7 @@
     python tools/watch_loop.py --log FILE     another console log of scripts/loop.sh
     python tools/watch_loop.py --once         one frame, then exit            Stop: Ctrl+C
     python tools/watch_loop.py --still        colours without motion          --no-color: plain text
+    python tools/watch_loop.py --max 20       the most loops the operator runs (shown with the stop counts)
 
 It reads three files and writes none: the loop's console log (the lines scripts/loop_main.py prints), loop/results.tsv
 and loop/faults.tsv. It opens nothing under evals/, loop/attack/ or loop/runs/: the loop moves those folders away while
@@ -35,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LINE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\] loop (\d+) (.*)$")
 AGENT = re.compile(r"^(\d+-[A-Za-z0-9_-]+?)(?: (시작|끝))?(?::.*)?$")
 RETRY = re.compile(r"(\d+)초 뒤 다시 실행")
+SMALL_GAIN = 0.005  # a loop whose dev score rose less than this is a "small gain" (the operator stops after 3 in a row)
 
 # The steps of one loop in order: key, who does it, what it is. "search" only happens when the attacker found too few
 # weaknesses, so it is shown only when the log has it.
@@ -155,7 +157,7 @@ def following(key: str) -> str | None:
 def view(run: dict, loop: int, begun: datetime | None) -> dict:
     """One loop's steps: state (done | running | stopped | pending | skipped), times and what its lines told."""
     steps = {key: {"state": "pending", "start": None, "end": None, "seen": False, "info": {}, "agent": None,
-                   "runs": 0, "retries": 0, "wait": None, "last": ""} for key in ORDER}
+                   "runs": 0, "retries": 0, "wait": None, "last": "", "light": False} for key in ORDER}
     active, last_time = "dev", begun
     steps["dev"]["start"] = begun
     events = [e for e in run["events"] if e["loop"] == loop]
@@ -180,6 +182,7 @@ def view(run: dict, loop: int, begun: datetime | None) -> dict:
         step["info"] |= event["fields"]
         if edge == "start":
             step["agent"], step["runs"], step["wait"] = (event["step"][:-3], event["time"]), step["runs"] + 1, None
+            step["light"] = event["fields"].get("light") == "1"  # run with CRITIC_LIGHT_CMD (scripts/loop_main.py)
         elif edge == "end":
             step["agent"] = None
             over = over or (key in ("hint", "attack") and event["fields"].get("exit") == "0")
@@ -235,6 +238,8 @@ def told(key: str, step: dict) -> str:
         out = [f"바꾼 파일 {info['files']}개"]
     elif key == "check" and "problem" in info:
         out = ["유지 조건을 만족함" if info["problem"] == "없음" else f"유지 못함: {info['problem']}"]
+    if key in ("hint", "judge1", "judge2") and step["info"].get("light") == "1":
+        out.append("가벼운 명령")
     if key in ("attack", "judge1", "brief", "review") and step["runs"] > 1:
         out.append(f"에이전트 실행 {step['runs']}번")
     if step["retries"]:
@@ -435,7 +440,7 @@ def frame(data: dict, paint: Paint, motion: Motion, width: int, now: datetime, w
         tail = [e["raw"] for e in run["events"][-4:]] + run["other"][-2:]
         if tail:
             lines += ["", paint("최근 줄", "1")] + [paint.dim("  " + fit(line, width - 2, False)) for line in tail]
-    lines += [""] + history(data["results"], data["faults"], paint, width)
+    lines += [""] + history(data["results"], data["faults"], paint, width, data.get("max"))
     return lines
 
 
@@ -517,7 +522,7 @@ def loop_lines(run: dict, state: dict, begun: datetime | None, paint: Paint, mot
     return lines
 
 
-def history(results: list[dict], faults: list[dict], paint: Paint, width: int) -> list[str]:
+def history(results: list[dict], faults: list[dict], paint: Paint, width: int, most: int | None = None) -> list[str]:
     lines = [paint("끝난 루프 (loop/results.tsv)", "1")]
     if not results:
         lines.append(paint.dim("  아직 없음"))
@@ -532,6 +537,8 @@ def history(results: list[dict], faults: list[dict], paint: Paint, width: int) -
                        f"{fit(pair('attack_strict_before', 'attack_strict_after'), 19)} {row.get('reason', '')}", width, False)
             colour = {"1": GOOD, "done": GOOD, "blocked": WARN, "stop": WARN}.get(kept)
             lines.append(paint.ink(text, colour, kept == "done") if colour else text)
+        done, zeros, small = streaks(results)
+        lines.append(paint.dim(f"  전체 {done}/{most or '-'} · 연속 되돌림 {zeros}/3 · 작은 상승(기준 +{SMALL_GAIN} 미만) {small}/3"))
     if faults:
         last = faults[-1]
         lines += ["", paint(f"운영 오류 {len(faults)}건 (loop/faults.tsv). 마지막:", "1"),
@@ -670,6 +677,26 @@ def columns(paint: Paint, motion: Motion, state: dict, run: dict, width: int, no
     return out
 
 
+def streaks(results: list[dict]) -> tuple[int, int, int]:
+    """(loops recorded, kept=0 in a row at the end, small gains in a row at the end) from loop/results.tsv: the
+    counts the operator stops on (orchestrator prompt: kept=0 three times, a small gain three times, MAX loops).
+    A reverted loop counts as a small gain too; a loop that ended otherwise (done, stop, blocked) changes neither."""
+    numbers = {row["loop"] for row in results if row.get("loop", "").isdigit()}
+    zeros = small = 0
+    for row in results:
+        kept = row.get("kept")
+        if kept == "0":
+            zeros, small = zeros + 1, small + 1
+        elif kept == "1":
+            zeros = 0
+            try:
+                gain = float(row.get("dev_after", "")) - float(row.get("dev_before", ""))
+            except ValueError:
+                continue
+            small = small + 1 if gain < SMALL_GAIN else 0
+    return len(numbers), zeros, small
+
+
 def side_panel(data: dict, paint: Paint, state: dict | None, width: int, height: int) -> list[str]:
     inner, rows = width - 4, []
     info = {key: state["steps"][key]["info"] for key in ORDER} if state else {}
@@ -690,6 +717,11 @@ def side_panel(data: dict, paint: Paint, state: dict | None, width: int, height:
         mark, tone = {"1": ("✓", GOOD), "0": ("✗", WARN), "done": ("★", GOOD)}.get(kept, ("·", GRAY))
         rows.append(paint.ink(mark, tone) + f" {fit(row.get('loop', '-'), 3)}"
                     + f"{row.get('dev_before') or '-'}" + paint.dim(" → ") + f"{row.get('dev_after') or '-'}")
+    done, zeros, small = streaks(results)
+    if results:
+        warn = lambda count: paint.ink(f"{count}/3", WARN) if count >= 2 else paint(f"{count}/3", "1")
+        rows += [pair("전체", f"{done}/{data.get('max', '-')}"), paint.dim(fit("되돌림", 10)) + warn(zeros),
+                 paint.dim(fit("작은 상승", 10)) + warn(small)]
     faults = data["faults"]
     rows += ["", paint("운영 오류", "1") + (paint.ink(f"  {len(faults)}건", BAD) if faults else paint.dim("  없음"))]
     if faults:
@@ -779,7 +811,8 @@ def board(data: dict, paint: Paint, motion: Motion, width: int, now: datetime, w
         if step["wait"]:
             text = f"{who} · {what} · 에이전트가 실패해 기다리는 중, {step['wait'][0]:%H:%M}쯤 다시 실행"
         elif step["agent"]:
-            text = f"{who} · {what} · 에이전트 실행 중 {span((now - step['agent'][1]).total_seconds())}째 ({step['agent'][0]})"
+            text = (f"{who} · {what} · 에이전트 실행 중 {span((now - step['agent'][1]).total_seconds())}째 ({step['agent'][0]}"
+                    + (", 가벼운 명령)" if step["light"] else ")"))
         elif who == "스크립트":
             text = f"스크립트 · {what} 중 (추정: 이 단계는 시작할 때 줄이 찍히지 않음)"
         else:
@@ -826,6 +859,7 @@ def main() -> int:
     parser.add_argument("--still", action="store_true", help="색은 쓰되 움직임은 끔")
     parser.add_argument("--no-color", action="store_true", help="색과 움직임을 모두 끔")
     parser.add_argument("--list", action="store_true", help="상자 그림 대신 전의 목록 화면")
+    parser.add_argument("--max", type=int, default=20, help="운영자가 돌리는 최대 루프 수 (점수 칸의 '전체'에 보임)")
     args = parser.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -842,7 +876,7 @@ def main() -> int:
 
     if args.once:
         try:
-            print("\n".join(draw(load(args.log), paint, motion, size_now()[0], datetime.now(), None)))
+            print("\n".join(draw(load(args.log) | {"max": args.max}, paint, motion, size_now()[0], datetime.now(), None)))
         except OSError as problem:
             print(f"읽는 중 오류: {problem}")
         return 0
@@ -855,7 +889,7 @@ def main() -> int:
             motion.tick()
             if data is None or motion.t - read_at >= interval:
                 try:
-                    data, problem = load(args.log), ""
+                    data, problem = load(args.log) | {"max": args.max}, ""
                     motion.note(data)
                 except OSError as error:  # the file was being replaced just then: the next round reads it
                     problem = f"읽는 중 오류 (다음에 다시 읽음): {error}"

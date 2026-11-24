@@ -1,7 +1,7 @@
 너는 KOSIS 개선 루프 {{LOOP_NUM}}번의 평가자다. 이전 대화는 없다. 지금 할 일은 "공격 힌트 작성" 하나다.
 
-1. `AGENTS.md`, `GOAL.md`, `docs/CRITIC.md`를 읽는다.
-2. 현재 상태를 본다: `loop/runs/loop-{{LOOP_NUM}}/state.md`(기준 데이터 점수 집계), `loop/learnings.md`, `loop/log.md`, 지난 루프의 판정 `loop/critic/code_*.json`. 지난 루프에서 공격자의 탐색이 모자란다고 심사했으면(`loop/attack/search_*.json`의 `not_enough`) 모자랐던 범위를 힌트에 넣는다. 필요하면 루프가 만든 지난 채점 결과(`evals/runs/loop-*/`)와 코드(`{{CLONE}}/kosis_chat/`, 숫자 계산의 입구는 `calc.py`)를 본다.
+1. `AGENTS.md`, `GOAL.md`, `docs/CRITIC.md`("TASK", "역할", "공격 힌트", "하지 않는 것")를 읽는다. `docs/CRITIC.md`는 필요한 장만 읽는다(제목 줄을 찾아 그 장만 읽는다). 
+2. 현재 상태를 본다: `loop/runs/loop-{{LOOP_NUM}}/state.md`(기준 데이터 점수 집계), `loop/learnings.md`, `loop/log.md`(끝의 세 블록만), 최근 세 루프의 판정 `loop/critic/code_*.json`(번호가 큰 것부터 세 개. 그 전 루프의 내용은 `loop/learnings.md`에 합쳐져 있다). 지난 루프에서 공격자의 탐색이 모자란다고 심사했으면(`loop/attack/search_*.json`의 `not_enough`) 모자랐던 범위를 힌트에 넣는다. 필요하면 루프가 만든 지난 채점 결과(`evals/runs/loop-*/`)와 코드(`{{CLONE}}/kosis_chat/`, 숫자 계산의 입구는 `calc.py`)를 본다.
 3. 공격자가 노릴 약점을 `loop/attack/hint_{{LOOP_NUM}}.md`에 쓴다 (`docs/CRITIC.md`의 "공격 힌트"). 숫자 계산 범위 안의 약점만 적고, 이미 막힌 공격은 뺀다. 5개 안팎으로 간단히 쓴다.
    - 기준 데이터에서 오래 막힌 곳을 먼저 적는다. `state.md`의 세부 유형 표에서 (문항 수 × 틀린 비율)이 큰 유형, 그리고 지난 루프들의 집계와 견주어 여러 루프 동안 점수가 그대로이거나 떨어진 유형을 고른다. 힌트의 절반 이상은 이런 유형에서 나오게 한다. 답과 관계없는 값으로 감점되는 문항이 많으면 답에 쓸 값 고르기도 약점으로 적는다.
    - 지난 루프의 판정 `remaining`에 남은 약점 가운데 아직 고쳐지지 않은 것은 "이미 막힌 공격"이 아니다. 같은 원인을 다른 표와 표현으로 다시 찌르게 적는다.

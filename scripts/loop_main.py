@@ -111,6 +111,10 @@ FAIL_FAST_MAX = 3  # quick failures in a row that end the run as a setting fault
 RECORDS = {"log.md": "loop/log.md", "learnings.md": "loop/learnings.md", "current-state.md": "docs/current-state.md"}
 RECORDS_CHECKED = "loop/runs/records_checked.json"  # hashes of the record files as last checked for item content
 REASK = 2  # times the critic is asked again for the verdicts it left out
+# The critic's steps that check or copy what another step decided (verdicts, the log note, rewrites of a draft, the
+# hint). With CRITIC_LIGHT_CMD set they run with it (a cheaper model); the search review, the brief and the code
+# review keep CRITIC_CMD. Names as agent_once() gets them: "-restN" (verdicts asked again), "-retryN" (a new try).
+LIGHT_STEP = re.compile(r"(1-hint|3-judge1-\d+|5-judge2|7-brief-2|10-note|10-record-rewrite)(-rest\d+)?(-retry\d+)?")
 PYARROW_MIN = 15  # what Phase 1 asks for (its pyproject.toml); scripts/show_table.py fails on some tables under 11
 TESTS_BEFORE_TIMEOUT = 900  # seconds for the defender's new tests on the code before the fix
 # With the rules alone an item in error is a graded item. A dev measurement with this share of its items in error
@@ -189,6 +193,13 @@ class Settings:
         self.vault = Path(setting("VAULT_DIR", str(Path.home() / ".kosis_loop_vault"))) / hashlib.sha256(
             str(ROOT).encode("utf-8")).hexdigest()[:10]
         self.commands = {role: setting(f"{role.upper()}_CMD") for role in ("attacker", "defender", "critic")}
+        self.light_cmd = setting("CRITIC_LIGHT_CMD")  # optional: the critic's LIGHT_STEP steps (empty: CRITIC_CMD)
+
+    def command(self, role: str, step: str) -> tuple[str, bool]:
+        """The command a step runs with, and whether it is CRITIC_LIGHT_CMD."""
+        if role == "critic" and self.light_cmd and LIGHT_STEP.fullmatch(step):
+            return self.light_cmd, True
+        return self.commands[role], False
 
 
 # ---------------------------------------------------------------- small helpers
@@ -680,14 +691,14 @@ class Loop:
 
     def agent_once(self, role: str, step: str, prompt: str, hidden: bool) -> tuple[Path, Path, int, float]:
         """One run of an agent. Returns (its log now, where the log is once the vault is put back, exit code, seconds)."""
-        command = self.s.commands[role]
+        command, light = self.s.command(role, step)
         rel = f"loop/runs/loop-{self.n}/{step}"
         base = self.vault.path(rel) if hidden else ROOT / rel
         base.parent.mkdir(parents=True, exist_ok=True)
         log = fresh(base.with_suffix(".log"))
         log.with_suffix(".prompt.md").write_text(prompt, encoding="utf-8")
         env = os.environ | {"LOOP_NUM": str(self.n), "LOOP_ROLE": role}
-        self.note(f"{step} 시작", role=role)
+        self.note(f"{step} 시작", role=role, **({"light": 1} if light else {}))
         started = time.time()
         with log.open("wb") as out:
             try:
@@ -1628,7 +1639,8 @@ def preflight(s: Settings) -> list[str]:
             problems.append(f"클론의 브랜치가 {branch}임 (LOOP_BRANCH={s.branch})")
         if run(["git", "-C", str(s.clone), "status", "--porcelain"]).stdout.strip():
             problems.append("클론에 커밋하지 않은 변경이 있음 (커밋하거나 되돌린 뒤 시작)")
-    for role, command in s.commands.items():
+    commands = list(s.commands.items()) + ([("critic_light", s.light_cmd)] if s.light_cmd else [])
+    for role, command in commands:
         if not command:
             problems.append(f"{role.upper()}_CMD 가 비어 있음 (loop/config.env)")
             continue

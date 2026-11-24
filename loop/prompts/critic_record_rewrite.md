@@ -4,7 +4,7 @@
 
 {{LEAKS}}
 
-1. `AGENTS.md`, `docs/CRITIC.md`("방어자에게 주는 피드백")를 읽는다.
+1. `AGENTS.md`(7장), `docs/CRITIC.md`("방어자에게 주는 피드백")를 읽는다. 필요한 장만 읽는다(제목 줄을 찾아 그 장만 읽는다). 
 2. 위에 나온 파일에서 문항 내용을 지우거나 일반적인 말로 바꾼다. 질문 문구, 표 이름과 번호, 분류 이름, 정답 값은 적지 않는다. 어느 문항의 무엇이 섞였는지는 위 id의 문항(`evals/golden_*.jsonl`)과 견주어 찾는다.
    - `log.md`, `learnings.md`, `current-state.md`는 초안 폴더 `loop/attack/records_{{LOOP_NUM}}/`에 있다. 이번 루프에서 새로 쓴 부분만 고친다.
    - `code_{{LOOP_NUM}}.json`은 `loop/critic/`에 있다. `verdict`는 바꾸지 않고 `reason`과 `tests`의 문구만 고친다.

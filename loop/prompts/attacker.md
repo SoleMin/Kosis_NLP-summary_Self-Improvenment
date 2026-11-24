@@ -1,7 +1,7 @@
 너는 KOSIS 개선 루프 {{LOOP_NUM}}번의 공격자다. 이전 대화는 없다.
 
 1. `AGENTS.md`, `GOAL.md`, `docs/ATTACKER.md`를 읽는다. 문항 형식과 표를 보는 도구는 `docs/ATTACKER.md`의 "입력과 출력"에 있다.
-2. 평가자의 힌트 `loop/attack/hint_{{LOOP_NUM}}.md`와 `loop/learnings.md`를 읽고, 코드(`{{CLONE}}/kosis_chat/`, 숫자 계산의 입구는 `calc.py`)를 확인한다. 지난 공격 문항은 `loop/attack/spec_*.jsonl`에 있다.
+2. 평가자의 힌트 `loop/attack/hint_{{LOOP_NUM}}.md`와 `loop/learnings.md`를 읽고, 코드(`{{CLONE}}/kosis_chat/`, 숫자 계산의 입구는 `calc.py`)를 확인한다. 지난 공격 문항은 `loop/attack/spec_*.jsonl`에 있다. 최근 세 루프의 파일만 본다(번호가 큰 것부터 세 개). 그 전 루프에서 이미 막힌 공격은 `loop/learnings.md`에 있다.
 3. 공격 문항을 `loop/attack/spec_{{LOOP_NUM}}.jsonl`에 쓴다. 목표는 {{ATTACK_COUNT}}건이다. 한 줄에 문항 하나, id는 `L{{LOOP_NUM}}-001`부터 붙인다. 정답 숫자는 쓰지 않는다. 숫자는 스크립트가 표에서 채운다.
    - 질문은 통계를 찾는 사람이 실제로 쓸 문장이어야 한다 (`docs/ATTACKER.md`의 "자연스러운 질문의 기준"). 문장을 망가뜨리거나 꼬아서 틀리게 만든 질문, 그 문장만을 위한 처리를 넣어야 맞힐 수 있는 질문은 평가자가 부적절로 판정한다. `weakness`에는 같은 약점을 가진 질문 전체를 가리키는 말을 적는다.
    - 코드가 실제로 틀리는 문항이 먼저다. 질문이 실제로 틀리는지는 `python scripts/try_question.py "<질문>" <표 키>`로 확인할 수 있다. 규칙만으로 돌고 모델은 부르지 않는다. 이미 풀리는 질문은 내지 않는다. 코드가 낸 값을 답으로 쓰지 않는다.
