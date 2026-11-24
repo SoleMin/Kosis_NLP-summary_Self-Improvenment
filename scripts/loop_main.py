@@ -100,6 +100,8 @@ LOG_TAIL = 4000  # bytes of the log's end searched for LIMIT
 TIMED_OUT = -1  # the exit code recorded for a run stopped at AGENT_TIMEOUT
 RETRY_QUICK = 600  # seconds: a second or later try that worked longer than this and failed again is not retried
 FAIL_FAST = 30  # seconds: a failure this quick without the words of a limit is a setting (a wrong command or model name)
+# ... unless a try of the same step already hit a limit: then the limit is still closed (loop 7: the defender's
+# retries ended in 3-7 s with no words of a limit and no API time, 30 minutes after a try that had them)
 FAIL_FAST_WAIT = 60  # seconds before such a failure runs again (a dropped connection may also end quickly)
 FAIL_FAST_MAX = 3  # quick failures in a row that end the run as a setting fault
 
@@ -636,7 +638,7 @@ class Loop:
         with the words of a limit at the end of its log. strict (the defender, whose output is the clone): any
         failure exit code, or those words with the clone unchanged. A run stopped at AGENT_TIMEOUT has not failed in
         this sense (it worked the whole time) and is not run again. reset() is called before each new try."""
-        tries, quick_count = 0, 0
+        tries, quick_count, seen_limit = 0, 0, False
         while True:
             before = file_digest(output) if output is not None else None
             name = step if tries == 0 else f"{step}-retry{tries}"
@@ -652,7 +654,8 @@ class Loop:
                 return final
             why = f"{role}가 {name} 단계를 하지 못함 (exit {code}{', 로그에 한도 문구' if limited else ''})"
             last = self.safe(last_line(log))  # what the agent said last: the cause, for loop/faults.tsv
-            quick = not limited and code != TIMED_OUT and seconds < FAIL_FAST
+            seen_limit = seen_limit or limited
+            quick = not seen_limit and code != TIMED_OUT and seconds < FAIL_FAST
             quick_count = quick_count + 1 if quick else 0
             if quick_count >= FAIL_FAST_MAX:
                 raise AgentFailed(f"{why}. {int(seconds)}초 만에 한도 문구 없이 {quick_count}번 이어서 실패함: 설정(명령, 실행 파일, 모델 이름) "

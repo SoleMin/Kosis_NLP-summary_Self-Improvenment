@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[03:26:03] loop 10 · 기준 점수 · score=0.4561 · strict=0.4546 · reused=True · errors=0
+[03:26:03] loop 10 · 1-hint 시작 · role=critic
+[03:34:01] loop 10 · 1-hint 끝 · exit=0 · seconds=478
+[03:34:02] loop 10 · 2-attack-1 시작 · role=attacker
+[03:39:54] loop 10 · 2-attack-1 끝 · exit=0 · seconds=352
+[03:39:54] loop 10 · 3-judge1-1 시작 · role=critic
+[03:43:08] loop 10 · 3-judge1-1 끝 · exit=0 · seconds=193
+[03:43:08] loop 10 · 1차 판정 · specs=20 · rejected=2
+[03:43:09] loop 10 · 값 채우기 · built=18 · specs=18 · exit=0
+[03:43:09] loop 10 · 5-judge2 시작 · role=critic
+[03:44:51] loop 10 · 5-judge2 끝 · exit=0 · seconds=102
+[03:44:52] loop 10 · 2차 판정 · built=18 · kept=18
+[03:47:19] loop 10 · 수정 전 점수 · attack=0.0417 · attack_strict=0.0417 · past=0.3468 · errors=0
+[03:47:19] loop 10 · 7-brief-1 시작 · role=critic
+[04:03:04] loop 10 · 7-brief-1 끝 · exit=0 · seconds=945
+[04:03:04] loop 10 · 약점 설명 검사 · leaks=0
+[04:03:05] loop 10 · 8-defender 시작 · role=defender
+[04:15:09] loop 10 · 8-defender 끝 · exit=0 · seconds=724
+[04:15:09] loop 10 · 방어자 변경 · files=7
+[04:24:42] loop 10 · 유지 조건 · problem=기준 데이터 점수가 떨어짐
+[04:24:43] loop 10 · 10-review-1 시작 · role=critic
+[04:34:44] loop 10 · 10-review-1 끝 · exit=0 · seconds=601
+[04:34:45] loop 10 · 기록 초안 검사 · leaks=0
+[04:34:45] loop 10 끝: kept=0 (기준 데이터 점수가 떨어짐)
+종료: 한 번 실행함

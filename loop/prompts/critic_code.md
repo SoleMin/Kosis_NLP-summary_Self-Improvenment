@@ -17,5 +17,6 @@
    - `log.md` (`loop/log.md`가 됨): 이번 루프 한 블록을 끝에 추가 (무엇을 공격했고, 무엇을 고쳤고, 결과가 어땠는지)
    - `learnings.md` (`loop/learnings.md`가 됨): 새로 알게 된 실패 원인과 이미 막힌 공격 유형을 추가
    - `current-state.md` (`docs/current-state.md`가 됨): 다음 루프가 이어갈 수 있게 갱신
+   - 세 파일은 모든 에이전트가 루프마다 읽는다. 길어지면 읽는 데 시간이 들고 앞의 내용이 묻힌다. `learnings.md`는 새 줄을 더하기 전에 같은 원인을 말하는 지난 줄과 합치고, 이미 고쳐져 더는 해당하지 않는 줄은 지운다. `current-state.md`의 "다음에 할 일"에서는 끝난 일을 지운다. `log.md`는 이번 블록을 20줄 안쪽으로 쓴다.
 {{NOTE}}
 `loop/critic/code_{{LOOP_NUM}}.json`과 초안 폴더의 세 파일만 쓴다. `{{CLONE}}/` 안의 코드는 고치지 않는다. `evals/`, `scripts/`도 고치지 않는다. git 명령은 쓰지 않는다.

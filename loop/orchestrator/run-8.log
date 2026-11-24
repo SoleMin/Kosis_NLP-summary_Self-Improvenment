@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[10:17:33] loop 8 · 기준 점수 · score=0.4390 · strict=0.4375 · reused=False · errors=1
+[10:17:33] loop 8 · 1-hint 시작 · role=critic
+[10:27:48] loop 8 · 1-hint 끝 · exit=0 · seconds=614
+[10:27:49] loop 8 · 2-attack-1 시작 · role=attacker
+[10:32:11] loop 8 · 2-attack-1 끝 · exit=0 · seconds=262
+[10:32:11] loop 8 · 3-judge1-1 시작 · role=critic
+[10:36:12] loop 8 · 3-judge1-1 끝 · exit=0 · seconds=241
+[10:36:12] loop 8 · 1차 판정 · specs=20 · rejected=0
+[10:36:14] loop 8 · 값 채우기 · built=20 · specs=20 · exit=0
+[10:36:14] loop 8 · 5-judge2 시작 · role=critic
+[10:37:30] loop 8 · 5-judge2 끝 · exit=0 · seconds=75
+[10:37:30] loop 8 · 2차 판정 · built=20 · kept=20
+[10:39:29] loop 8 · 수정 전 점수 · attack=0.0000 · attack_strict=0.0000 · past=0.3571 · errors=0
+[10:39:29] loop 8 · 7-brief-1 시작 · role=critic
+[10:52:31] loop 8 · 7-brief-1 끝 · exit=0 · seconds=782
+[10:52:31] loop 8 · 약점 설명 검사 · leaks=0
+[10:52:31] loop 8 · 8-defender 시작 · role=defender
+[11:06:02] loop 8 · 8-defender 끝 · exit=0 · seconds=810
+[11:06:02] loop 8 · 방어자 변경 · files=7
+[11:15:18] loop 8 · 유지 조건 · problem=없음
+[11:15:18] loop 8 · 10-review-1 시작 · role=critic
+[11:29:16] loop 8 · 10-review-1 끝 · exit=0 · seconds=837
+[11:29:16] loop 8 · 기록 초안 검사 · leaks=0
+[11:29:16] loop 8 끝: kept=1 (약점 설명의 A-1(경계가 같은 열린 구간), B-1(나누는 쪽을 조사로 말한 나눗셈), B-2(한 대상이 다른 대상의 몇 퍼센트인지, 일부 꼴만), C-2(대상 셋 이상의 저마다 변화), C-3(부분 여럿의 구성비를 저마다), D-1(이름으로 부른 대상 여럿의 평균과 하나씩 부른 시점들의 평균)을 원인 단계에서 고쳤다. 새 조건은 표의 정보(분류에 있는 )
+종료: 한 번 실행함

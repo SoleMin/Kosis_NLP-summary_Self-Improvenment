@@ -1,0 +1,26 @@
+파이썬: C:/Users/ckawo/AppData/Local/anaconda3/envs/kosis/python.exe
+[02:10:50] loop 9 · 기준 점수 · score=0.4461 · strict=0.4446 · reused=True · errors=0
+[02:10:50] loop 9 · 1-hint 시작 · role=critic
+[02:25:59] loop 9 · 1-hint 끝 · exit=0 · seconds=908
+[02:25:59] loop 9 · 2-attack-1 시작 · role=attacker
+[02:30:08] loop 9 · 2-attack-1 끝 · exit=0 · seconds=249
+[02:30:09] loop 9 · 3-judge1-1 시작 · role=critic
+[02:33:37] loop 9 · 3-judge1-1 끝 · exit=0 · seconds=208
+[02:33:37] loop 9 · 1차 판정 · specs=20 · rejected=0
+[02:33:39] loop 9 · 값 채우기 · built=20 · specs=20 · exit=0
+[02:33:39] loop 9 · 5-judge2 시작 · role=critic
+[02:35:02] loop 9 · 5-judge2 끝 · exit=0 · seconds=83
+[02:35:02] loop 9 · 2차 판정 · built=20 · kept=20
+[02:37:26] loop 9 · 수정 전 점수 · attack=0.0750 · attack_strict=0.0750 · past=0.3431 · errors=0
+[02:37:26] loop 9 · 7-brief-1 시작 · role=critic
+[02:53:15] loop 9 · 7-brief-1 끝 · exit=0 · seconds=948
+[02:53:15] loop 9 · 약점 설명 검사 · leaks=0
+[02:53:15] loop 9 · 8-defender 시작 · role=defender
+[03:03:08] loop 9 · 8-defender 끝 · exit=0 · seconds=593
+[03:03:08] loop 9 · 방어자 변경 · files=6
+[03:12:36] loop 9 · 유지 조건 · problem=없음
+[03:12:36] loop 9 · 10-review-1 시작 · role=critic
+[03:25:33] loop 9 · 10-review-1 끝 · exit=0 · seconds=776
+[03:25:33] loop 9 · 기록 초안 검사 · leaks=0
+[03:25:33] loop 9 끝: kept=1 (약점 설명의 B-1(부른 이름 안의 계산 낱말), B-2(전체를 뜻하는 부사와 양을 묻는 말로 물은 합, 한 표와 표 2개), C-1(상대 차이를 퍼센트로, 기준 읽기의 건너뛰기), D-1(같은 전체에 대한 두 부분의 구성비 차이), E-1(한 표에서 단위가 다른 두 항목의 나눗셈)을 원인 단계에서 고쳤다. 새 조건은 공용 표현 사전의 부류(퍼센트를 묻는 )
+종료: 한 번 실행함
