@@ -19,3 +19,6 @@ loop/attack/
 # Python
 *.py[cod]
 .env.*
+
+# 운영 세션의 실행 로그
+loop/orchestrator/run-*.log

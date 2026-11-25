@@ -111,6 +111,23 @@ FAIL_FAST_MAX = 3  # quick failures in a row that end the run as a setting fault
 RECORDS = {"log.md": "loop/log.md", "learnings.md": "loop/learnings.md", "current-state.md": "docs/current-state.md"}
 RECORDS_CHECKED = "loop/runs/records_checked.json"  # hashes of the record files as last checked for item content
 REASK = 2  # times the critic is asked again for the verdicts it left out
+# Items a kept fix may make worse (2026-11-24, after loop 13 was reverted for one partial point in one earlier set):
+# the dev part and the earlier attack sets together may lose at most REGRESS_MAX items, and the items that rose must
+# be at least REGRESS_SHARE times those that fell. The fallen items become a debt (DEBT): the next brief puts them
+# first, and while any is not paid back (its score as before the fall) no item may fall at all.
+# Since 2026-11-25 (loops 17 and 19 were reverted for one item owed since loop 16): each item owed takes one off the
+# allowance instead of all of it, whether a debt is paid is also measured right after the fix (outcome.md), and an
+# item owed for more than DEBT_LIFE loops is set aside (DEBT_EXPIRED) for a person to look at.
+REGRESS_SHARE = 5
+DEBT = "loop/attack/debt.json"  # (loop/attack/ is moved away while the defender runs)
+DEBT_EXPIRED = "loop/attack/debt_expired.json"
+# The holdout part of the baseline (evals/baseline/split.json) is never a keep condition. Every HOLDOUT_EVERY loops
+# the loop measures it on the code as committed, before the loop starts, and writes the score to HOLDOUT_FILE (numbers
+# only; evals/ is moved away while the defender runs). When it fell by more than HOLDOUT_DROP since the last
+# measurement while dev rose, the run stops and loop/blocked.md asks a person to look (dev is being overfitted).
+HOLDOUT_DIR = "evals/runs/holdout"  # (not under evals/runs/loop-N/, which the critic reads: AGENTS.md 7장)
+HOLDOUT_FILE = "loop/holdout.tsv"  # (numbers only: watch_loop.py reads it, and it opens nothing under evals/)
+HOLDOUT_HEADER = ["loop", "time", "commit", "dev", "dev_strict", "holdout", "holdout_strict", "items"]
 # The critic's steps that check or copy what another step decided (verdicts, the log note, rewrites of a draft, the
 # hint). With CRITIC_LIGHT_CMD set they run with it (a cheaper model); the search review, the brief and the code
 # review keep CRITIC_CMD. Names as agent_once() gets them: "-restN" (verdicts asked again), "-retryN" (a new try).
@@ -181,6 +198,10 @@ class Settings:
         self.eval_args = shlex.split(setting("EVAL_ARGS"))
         self.max_iter = int(setting("MAX_ITER", "10"))
         self.patience = int(setting("PATIENCE", "3"))
+        self.regress_max = int(setting("REGRESS_MAX", "2"))  # see REGRESS_SHARE; 0: no item may fall (the old rule)
+        self.debt_life = int(setting("DEBT_LIFE", "3"))  # loops an item may stay owed before it is set aside (0: never)
+        self.holdout_every = int(setting("HOLDOUT_EVERY", "5"))  # 0: the loop never measures the holdout part
+        self.holdout_drop = float(setting("HOLDOUT_DROP", "0.01"))
         self.attack_count = int(setting("ATTACK_COUNT", "20"))
         self.attack_min = int(setting("ATTACK_MIN", "5"))
         self.bad_ratio = float(setting("BAD_RATIO", "0.5"))
@@ -594,6 +615,10 @@ class Loop:
         self.golden = ROOT / "evals" / f"golden_{n}.jsonl"
         self.vault = Vault(s.vault)
         self.row = {k: "-" for k in RESULTS_HEADER} | {"loop": str(n)}
+        self.debt: list[dict] = []  # the regression debt still owed when this loop started (debt_now)
+        self.fell: list[dict] = []  # the items this loop's fix made worse (they become debt if it is kept)
+        self.debt_after: list[dict] | None = None  # the debt still owed after this loop's fix (None: not measured)
+        self.debt_expired = 0  # items set aside at the start of this loop (DEBT_LIFE)
         self.state: dict = {"loop": n, "steps": []}
         self.final_items = False  # evals/golden_N.jsonl holds the items both judgments passed (ATTACK_MIN or more)
         self.after_stop = ""  # a reason to stop once this loop is recorded
@@ -854,8 +879,8 @@ class Loop:
 
     # ---- measuring
 
-    def measure(self, tag: str, items: Path, split: str | None = None) -> dict:
-        out = fresh(ROOT / "evals" / "runs" / f"loop-{self.n}" / tag)
+    def measure(self, tag: str, items: Path, split: str | None = None, under: Path | None = None) -> dict:
+        out = fresh((under or ROOT / "evals" / "runs" / f"loop-{self.n}") / tag)
         cmd = [self.s.python, "evals/run_eval.py", "--items", str(items), "--out", str(out), "--backend", self.s.backend,
                "--phase1", str(self.s.clone), "--quiet", *(["--split", split] if split else []), *self.s.eval_args]
         errors, unread, summary, last = 0, 0, None, ""
@@ -929,39 +954,159 @@ class Loop:
                 "errors": sum(p["errors"] for p in parts), "unread": sum(p["unread"] for p in parts), "items": total,
                 "sets": dict(named)}
 
-    def item_changes(self, dev: dict, dev2: dict, past: dict | None, past2: dict | None) -> str:
+    @staticmethod
+    def graded(part: dict | None) -> dict[str, tuple[float, float]]:
+        """A measurement's items: id -> (score, same-inputs score). Empty when its graded.jsonl cannot be read."""
+        file = Path(part["run"]) / "graded.jsonl" if part and part.get("run") else None
+        if file is None or not file.is_file():
+            return {}
+        return {r["id"]: (float(r.get("score") or 0), float(r.get("score_same_inputs") or 0)) for r in load_jsonl(file)}
+
+    def item_moves(self, pairs: list[tuple[str, dict | None, dict | None]]) -> dict | None:
+        """The items whose score fell (with the scores they had) and how many rose, over (name, before, after)
+        measurements. None when a measurement's items cannot be read."""
+        fell, rose, compared = [], 0, 0
+        for name, before, after in pairs:
+            was, now = self.graded(before), self.graded(after)
+            if not was or not now:
+                return None
+            for key in sorted(was.keys() & now.keys()):
+                compared += 1
+                if now[key][0] < was[key][0] - EPS or now[key][1] < was[key][1] - EPS:
+                    fell.append({"id": key, "set": name, "score": was[key][0], "strict": was[key][1]})
+                elif now[key][0] > was[key][0] + EPS or now[key][1] > was[key][1] + EPS:
+                    rose += 1
+        return {"fell": fell, "rose": rose, "compared": compared}
+
+    @staticmethod
+    def past_pairs(past: dict | None, past2: dict | None) -> list[tuple[str, dict | None, dict | None]]:
+        return [(name, part, (past2 or {}).get("sets", {}).get(name)) for name, part in sorted((past or {}).get("sets", {}).items())]
+
+    def item_changes(self, moves: dict[str, dict | None]) -> str:
         """How many items' scores fell and rose with the change, in the dev part and in the earlier attack sets: counts
-        only (no id, no question), for outcome.md, which the critic and a person read. Not a keep condition: the
-        totals decide (2026-11-22). A fall here is a regression the next loop may have to fix."""
-        def grades(part: dict | None) -> dict[str, tuple[float, float]]:
-            file = Path(part["run"]) / "graded.jsonl" if part and part.get("run") else None
-            if file is None or not file.is_file():
-                return {}
-            return {r["id"]: (float(r.get("score") or 0), float(r.get("score_same_inputs") or 0)) for r in load_jsonl(file)}
-
-        def count(pairs: list[tuple[dict | None, dict | None]]) -> tuple[int, int, int] | None:
-            fell = rose = compared = 0
-            for before, after in pairs:
-                was, now = grades(before), grades(after)
-                if not was or not now:
-                    return None
-                for key in was.keys() & now.keys():
-                    compared += 1
-                    if now[key][0] < was[key][0] - EPS or now[key][1] < was[key][1] - EPS:
-                        fell += 1
-                    elif now[key][0] > was[key][0] + EPS or now[key][1] > was[key][1] + EPS:
-                        rose += 1
-            return fell, rose, compared
-
+        only (no id, no question), for outcome.md, which the critic and a person read. Since 2026-11-24 the counts
+        are a keep condition (REGRESS_MAX, REGRESS_SHARE)."""
         lines = []
-        old = [((past or {}).get("sets", {}).get(n), (past2 or {}).get("sets", {}).get(n)) for n in (past or {}).get("sets", {})]
-        for name, pairs in (("기준 데이터(판정용)", [(dev, dev2)]), ("지난 공격 문항", old)):
-            if not pairs:
+        for name, got in moves.items():
+            if got is None:
+                lines.append(f"- 문항별 변화, {name}: 문항별 결과를 읽지 못함")
                 continue
-            got = count(pairs)
-            lines.append(f"- 문항별 변화, {name}: " + ("문항별 결과를 읽지 못함" if got is None else
-                         f"{got[2]}건 중 점수가 떨어진 문항 {got[0]}건, 오른 문항 {got[1]}건"))
+            sets = sorted({f["set"] for f in got["fell"]})
+            lines.append(f"- 문항별 변화, {name}: {got['compared']}건 중 점수가 떨어진 문항 {len(got['fell'])}건, "
+                         f"오른 문항 {got['rose']}건" + (f" (떨어진 곳: {', '.join(sets)})" if name != "기준 데이터(판정용)" and sets else ""))
         return "".join(line + "\n" for line in lines)
+
+    @staticmethod
+    def read_debt(rel: str = DEBT) -> list[dict]:
+        file = ROOT / rel
+        try:
+            return json.loads(file.read_text(encoding="utf-8")) if file.is_file() else []
+        except (OSError, ValueError):
+            return []
+
+    @staticmethod
+    def write_debt(entries: list[dict], rel: str = DEBT) -> None:
+        file = ROOT / rel
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def debt_split(self, owed: list[dict], dev: dict | None, past: dict | None) -> tuple[list[dict], int]:
+        """(still owed, paid back) on the given measurements: an item is paid back when both its scores are at least
+        what they were before it fell. An item of a set that is gone is dropped; one that cannot be read stays."""
+        now = {"dev": self.graded(dev)} | {name: self.graded(part) for name, part in (past or {}).get("sets", {}).items()}
+        left, paid = [], 0
+        for entry in owed:
+            scores = now.get(entry.get("set"))
+            if scores is None:  # the set is gone: nothing to pay back
+                continue
+            if not scores:  # not readable now: still owed
+                left.append(entry)
+                continue
+            got = scores.get(entry.get("id"))
+            if got is not None and (got[0] < entry["score"] - EPS or got[1] < entry["strict"] - EPS):
+                left.append(entry)
+            else:
+                paid += 1
+        return left, paid
+
+    def debt_now(self, dev: dict, past: dict | None) -> list[dict]:
+        """The debt left by earlier kept fixes, measured on the code as it is now. Items owed for more than DEBT_LIFE
+        loops move to DEBT_EXPIRED (no longer first in the brief, no longer taken off the allowance). What is still
+        owed is written back and returned."""
+        owed = self.read_debt()
+        self.debt_expired = 0
+        if not owed:
+            return []
+        left, paid = self.debt_split(owed, dev, past)
+        life = self.s.debt_life
+        old = [e for e in left if life and self.n - int(e.get("loop", self.n)) > life]
+        if old:
+            self.write_debt(self.read_debt(DEBT_EXPIRED) + [e | {"expired": self.n} for e in old], DEBT_EXPIRED)
+            left = [e for e in left if e not in old]
+            self.debt_expired = len(old)
+        self.write_debt(left)
+        self.note("회귀 빚", owed=len(left), paid=paid, expired=len(old))
+        return left
+
+    def allowance(self) -> int:
+        """How many items this loop's fix may make worse: REGRESS_MAX less one for each item still owed."""
+        return max(0, self.s.regress_max - len(self.debt))
+
+    def settle_debt(self, left: list[dict], fell: list[dict]) -> None:
+        """After a kept fix: what is still owed on the new code, and the items the fix made worse (this loop's)."""
+        known = {(e["set"], e["id"]) for e in left}
+        self.write_debt(left + [f | {"loop": self.n} for f in fell if (f["set"], f["id"]) not in known])
+
+    def debt_items(self) -> list[dict]:
+        """The items the debt names (for the leak check of the brief that is told about them)."""
+        ids = {(e["set"], e["id"]) for e in self.debt}
+        out = [i for i in set_items(attack_sets()) if any(i.get("id") == d for _, d in ids)]
+        if any(s == "dev" for s, _ in ids):
+            out += [i for i in load_jsonl(ROOT / "evals" / "baseline" / "items.jsonl") if ("dev", i.get("id")) in ids]
+        return out
+
+    def holdout_due(self) -> bool:
+        if self.s.holdout_every <= 0:
+            return False
+        last = max((int(r["loop"]) for r in holdout_rows() if r.get("loop", "").isdigit()), default=None)
+        return last is None or self.n - last >= self.s.holdout_every
+
+    def holdout(self) -> str:
+        """Measure the holdout part on the code as committed (before loop n starts) and write it to HOLDOUT_FILE.
+        Returns why a person should look ('' when nothing is wrong). A measurement that cannot be used is noted and
+        skipped: the holdout part decides nothing."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        if self.clone_changes():
+            self.note("보관용 측정 건너뜀", why="클론에 커밋하지 않은 변경이 있음")
+            return ""
+        dev = self.measure_dev("dev-before")
+        held = self.measure(f"loop-{self.n}", ROOT / "evals" / "baseline" / "items.jsonl", "holdout", ROOT / HOLDOUT_DIR)
+        if self.broken(dev, held):
+            self.note("보관용 측정 건너뜀", why=self.trouble(**{"기준 데이터": dev, "보관용": held}))
+            return ""
+        rows = holdout_rows()
+        row = {"loop": str(self.n), "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+               "commit": self.git("rev-parse", "--short", "HEAD").stdout.strip(), "dev": f"{dev['score']:.4f}",
+               "dev_strict": f"{dev['strict']:.4f}", "holdout": f"{held['score']:.4f}",
+               "holdout_strict": f"{held['strict']:.4f}", "items": str(held["items"])}
+        file = ROOT / HOLDOUT_FILE
+        file.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["\t".join(HOLDOUT_HEADER)] + ["\t".join(r.get(k, "-") for k in HOLDOUT_HEADER) for r in [*rows, row]]
+        file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.note("보관용 점수", score=row["holdout"], strict=row["holdout_strict"], dev=row["dev"])
+        if not rows:
+            return ""
+        last = rows[-1]
+        try:
+            fell = float(row["holdout"]) < float(last["holdout"]) - self.s.holdout_drop
+            rose = float(row["dev"]) > float(last["dev"]) + EPS
+        except ValueError:
+            return ""
+        if not (fell and rose):
+            return ""
+        return (f"보관용 점수가 루프 {last['loop']} 시작 {last['holdout']} → 루프 {self.n} 시작 {row['holdout']}로 "
+                f"{self.s.holdout_drop} 넘게 떨어졌는데 같은 사이 기준 데이터는 {last['dev']} → {row['dev']}로 오름 "
+                f"(판정용에만 맞춘 수정 의심, {HOLDOUT_FILE})")
 
     @property
     def errors_count(self) -> bool:
@@ -1181,10 +1326,11 @@ class Loop:
             set_aside(file, self.dir / "stale")
             name = "critic_brief" if attempt == 1 else "critic_brief_rewrite"
             text = self.prompt(name, ATTACK_RUN=Path(attack["run"]).relative_to(ROOT).as_posix(),
-                               LEAKS="\n".join(f"- {x}" for x in found))
+                               LEAKS="\n".join(f"- {x}" for x in found), DEBT=self.debt_text())
             self.guarded("critic", f"7-brief-{attempt}", text, may, output=file)
             self.need(file, "평가자", "방어자용 약점 설명")
-            found = leaks(file.read_text(encoding="utf-8"), items)
+            # (the brief may now describe failures of earlier attacks too: their items are checked as well)
+            found = leaks(file.read_text(encoding="utf-8"), items + set_items(attack_sets(self.n)) + self.debt_items())
             self.note("약점 설명 검사", leaks=len(found))
             if not found:
                 break
@@ -1195,6 +1341,12 @@ class Loop:
         with file.open("a", encoding="utf-8") as f:
             f.write("\n\n## 집계 (스크립트가 붙임)\n\n" + aggregate_md("이번 공격 문항", attack["summary"], False) + "\n"
                     + aggregate_md("기준 데이터(판정용)", dev["summary"], True))
+
+    def debt_text(self) -> str:
+        if not self.debt:
+            return "없음"
+        return "\n".join(f"- `{e['id']}` ({'기준 데이터(판정용)' if e['set'] == 'dev' else e['set']}, 루프 {e.get('loop', '?')}에서 떨어짐. "
+                         f"떨어지기 전 점수 {e['score']:.4f}, 칸 일치 {e['strict']:.4f})" for e in self.debt)
 
     def defend(self) -> tuple[str | None, Path]:
         """Run the defender with the data hidden. Returns (why the change cannot stay | None, its log)."""
@@ -1487,6 +1639,7 @@ class Loop:
         def pair(part: dict | None) -> tuple[str, str]:
             return ("-", "-") if part is None else (f"{part['score']:.4f}", f"{part['strict']:.4f}")
 
+        self.debt = self.debt_now(dev, past)
         self.row["attack_before"], self.row["attack_strict_before"] = pair(attack)
         self.row["past_before"], self.row["past_strict_before"] = pair(past)
         self.note("수정 전 점수", attack=self.row["attack_before"], attack_strict=self.row["attack_strict_before"],
@@ -1526,18 +1679,33 @@ class Loop:
                 # attack has to rise by the same-inputs score (a number that equals the answer but is made from other
                 # cells raises the plain score alone: evals/grade.py) and may not fall by the plain one: a fix that
                 # only makes the right cells be read is an improvement too.
-                # Each earlier attack set on its own too (2026-11-22): a fall in one set is not made up by a rise in
-                # another. A set measured after the fix only (none) is not compared.
+                # Each earlier attack set on its own was a condition from 2026-11-22 to 11-24; now the items are
+                # counted instead (REGRESS_MAX, REGRESS_SHARE) and a set's own score is written down only.
                 failed = []
-                sets = [(f"지난 공격 문항({name})", part, (past2 or {}).get("sets", {}).get(name))
-                        for name, part in sorted((past or {}).get("sets", {}).items())]
-                for name, before, after in (("기준 데이터", dev, dev2), ("지난 공격 문항", past, past2), *sets):
+                sets = [(f"지난 공격 문항({name})", before, after) for name, before, after in self.past_pairs(past, past2)]
+                for name, before, after in (("기준 데이터", dev, dev2), ("지난 공격 문항", past, past2)):
                     if before is None or after is None:
                         continue
                     for key, label in (("score", "점수"), ("strict", "칸 일치 점수")):
                         if after[key] < before[key] - EPS:
                             failed.append(f"{name} {label}가 떨어짐")
                             break  # (the plain score says it; the same-inputs score is not named on top)
+                moves = {"기준 데이터(판정용)": self.item_moves([("dev", dev, dev2)])}
+                if past is not None:
+                    moves["지난 공격 문항"] = self.item_moves(self.past_pairs(past, past2))
+                allowed = self.allowance()
+                self.debt_after, paid_now = self.debt_split(self.debt, dev2, past2)
+                if any(m is None for m in moves.values()):
+                    failed.append("문항별 결과를 읽지 못해 떨어진 문항을 셀 수 없음")
+                else:
+                    fell = [f for m in moves.values() for f in m["fell"]]
+                    rose = sum(m["rose"] for m in moves.values())
+                    if len(fell) > allowed:
+                        failed.append(f"떨어진 문항 {len(fell)}건이 허용량 {allowed}건을 넘음"
+                                      + (f" (갚지 않은 회귀 빚 {len(self.debt)}건만큼 줄어든 허용량)" if self.debt else ""))
+                    elif fell and rose < REGRESS_SHARE * len(fell):
+                        failed.append(f"오른 문항 {rose}건이 떨어진 문항 {len(fell)}건의 {REGRESS_SHARE}배에 못 미침")
+                    self.fell = fell
                 if attack2["score"] < attack["score"] - EPS:
                     failed.append("이번 공격 문항 점수가 떨어짐")
                 elif attack2["strict"] <= attack["strict"] + EPS:
@@ -1552,11 +1720,15 @@ class Loop:
                 elif tested == "unknown":
                     failed.append("방어자의 테스트를 수정 전 코드에서 확인하지 못함")
                 problem = ", ".join(failed) or None
-                metrics = self.item_changes(dev, dev2, past, past2) + "".join(
+                metrics = self.item_changes(moves) + (
+                    f"- 회귀 빚: 루프를 시작할 때 갚지 않은 문항 {len(self.debt)}건"
+                    + (f"(만기로 넘긴 {self.debt_expired}건 제외)" if self.debt_expired else "")
+                    + f", 이번 수정 뒤 갚음 {paid_now}건·남음 {len(self.debt_after)}건, 이번 허용량 {allowed}건 "
+                    f"(유지되면 이번에 떨어진 문항이 빚이 됨. 갚았는지는 이 줄의 숫자로만 적음)\n") + "".join(
                     f"- {name}: {self.row[f'{key}_before']} → {self.row[f'{key}_after']} (칸 일치 점수 "
                     f"{self.row[f'{key}_strict_before']} → {self.row[f'{key}_strict_after']})\n"
                     for name, key in (("기준 데이터(판정용)", "dev"), ("이번 공격 문항", "attack"), ("지난 공격 문항", "past"))
-                ) + "".join(  # each earlier attack set on its own, as the keep condition compares them (2026-11-22)
+                ) + "".join(  # each earlier attack set on its own (written down; not a condition since 2026-11-24)
                     f"- {name}: {pair(before)[0]} → {pair(after)[0]} (칸 일치 점수 {pair(before)[1]} → {pair(after)[1]})\n"
                     for name, before, after in sets if before is not None and after is not None
                 ) + metrics
@@ -1581,6 +1753,9 @@ class Loop:
             self.row |= {"kept": "1", "reason": why[:200] or "유지",
                          "commit": self.git("rev-parse", "--short", "HEAD").stdout.strip()}
             self.remember_dev(dev2)  # the next loop starts from this commit: its dev score is known
+            if self.debt_after is not None or self.fell:
+                self.settle_debt(self.debt_after if self.debt_after is not None else self.debt, self.fell)
+                self.note("회귀 빚 정리", owed=len(self.debt_after or []), added=len(self.fell))
             return True
         self.revert()
         self.row |= {"kept": "0", "reason": problem[:300], "commit": "reverted" if changed else "-"}
@@ -1595,6 +1770,14 @@ def results_rows() -> list[list[str]]:
         return []
     lines = [line.split("\t") for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
     return lines[1:] if lines and lines[0][0] in ("loop", "iter") else lines
+
+
+def holdout_rows() -> list[dict[str, str]]:
+    file = ROOT / HOLDOUT_FILE
+    if not file.is_file():
+        return []
+    lines = [line.split("\t") for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [dict(zip(HOLDOUT_HEADER, line)) for line in lines[1:]]
 
 
 def record(row: dict) -> None:
@@ -1621,7 +1804,7 @@ def record_fault(n: int, fault: Fault) -> None:
 
 
 def commit_records(n: int, row: dict) -> None:
-    paths = [p for p in ("loop/results.tsv", "loop/faults.tsv", "loop/log.md", "loop/learnings.md", "loop/defender",
+    paths = [p for p in ("loop/results.tsv", "loop/faults.tsv", "loop/holdout.tsv", "loop/log.md", "loop/learnings.md", "loop/defender",
                          "loop/critic", "docs/current-state.md") if (ROOT / p).exists()]
     run(["git", "-C", str(ROOT), "add", "--", *paths])
     done = run(["git", "-C", str(ROOT), "commit", "-qm", f"loop {n}: kept={row['kept']} ({row['reason'][:60]})", "--", *paths])
@@ -1716,6 +1899,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--restore", action="store_true", help="put back what is in the vault")
     p.add_argument("--verify", action="store_true", help="the defender's gate")
     p.add_argument("--once", action="store_true", help="run one loop and stop")
+    p.add_argument("--holdout", action="store_true", help="measure the holdout part now (HOLDOUT_FILE), run nothing else")
     args = p.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -1736,6 +1920,10 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = results_rows()
     start = max((int(r[0]) for r in rows if r and r[0].isdigit()), default=0)
+    if args.holdout:  # (as if before the next loop: that loop then counts it as measured)
+        why = Loop(s, start + 1).holdout()
+        print(why or f"보관용 측정 끝 ({HOLDOUT_FILE})")
+        return 0
     streak, reason, code = 0, "", 0  # streak: loops in a row that kept nothing, counted within this run
     for n in range(start + 1, start + 1 + (1 if args.once else s.max_iter)):
         if (ROOT / "loop" / "STOP").exists():
@@ -1752,6 +1940,14 @@ def main(argv: list[str] | None = None) -> int:
             reason = f"{s.patience}번 연속으로 유지하지 못함"
             break
         loop = Loop(s, n)
+        if loop.holdout_due():
+            why = loop.holdout()
+            if why:  # a person decides; no row: loop n runs when the run starts again
+                with (ROOT / "loop" / "blocked.md").open("a", encoding="utf-8") as f:
+                    f.write(f"\n## 보관용 점수 확인 (루프 {n} 시작 전, 스크립트)\n\n- {why}\n"
+                            f"- 확인하고 이 절을 지운 뒤 다시 시작한다.\n")
+                reason = "사람에게 넘김: " + why
+                break
         try:
             try:
                 kept = loop.run()

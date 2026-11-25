@@ -6,8 +6,8 @@
     python tools/watch_loop.py --still        colours without motion          --no-color: plain text
     python tools/watch_loop.py --max 20       the most loops the operator runs (shown with the stop counts)
 
-It reads three files and writes none: the loop's console log (the lines scripts/loop_main.py prints), loop/results.tsv
-and loop/faults.tsv. It opens nothing under evals/, loop/attack/ or loop/runs/: the loop moves those folders away while
+It reads its files and writes none: the loop's console log (the lines scripts/loop_main.py prints), loop/results.tsv,
+loop/faults.tsv and loop/holdout.tsv. It opens nothing under evals/, loop/attack/ or loop/runs/: the loop moves those folders away while
 the defender runs, and a file held open there would make the move fail on Windows. The files it reads hold step names,
 counts, scores and reasons, no item contents.
 
@@ -680,7 +680,8 @@ def columns(paint: Paint, motion: Motion, state: dict, run: dict, width: int, no
 def streaks(results: list[dict]) -> tuple[int, int, int]:
     """(loops recorded, kept=0 in a row at the end, small gains in a row at the end) from loop/results.tsv: the
     counts the operator stops on (orchestrator prompt: kept=0 three times, a small gain three times, MAX loops).
-    A reverted loop counts as a small gain too; a loop that ended otherwise (done, stop, blocked) changes neither."""
+    A reverted loop counts as a small gain too; a loop that ended otherwise (done, stop, blocked) changes neither.
+    A kept loop is not a small gain when dev or the earlier attacks together rose by SMALL_GAIN or more (2026-11-25)."""
     numbers = {row["loop"] for row in results if row.get("loop", "").isdigit()}
     zeros = small = 0
     for row in results:
@@ -689,11 +690,15 @@ def streaks(results: list[dict]) -> tuple[int, int, int]:
             zeros, small = zeros + 1, small + 1
         elif kept == "1":
             zeros = 0
-            try:
-                gain = float(row.get("dev_after", "")) - float(row.get("dev_before", ""))
-            except ValueError:
+            gains = []
+            for key in ("dev", "past"):
+                try:
+                    gains.append(float(row.get(f"{key}_after", "")) - float(row.get(f"{key}_before", "")))
+                except ValueError:
+                    pass
+            if not gains:
                 continue
-            small = small + 1 if gain < SMALL_GAIN else 0
+            small = small + 1 if max(gains) < SMALL_GAIN else 0
     return len(numbers), zeros, small
 
 
@@ -722,6 +727,10 @@ def side_panel(data: dict, paint: Paint, state: dict | None, width: int, height:
         warn = lambda count: paint.ink(f"{count}/3", WARN) if count >= 2 else paint(f"{count}/3", "1")
         rows += [pair("전체", f"{done}/{data.get('max', '-')}"), paint.dim(fit("되돌림", 10)) + warn(zeros),
                  paint.dim(fit("작은 상승", 10)) + warn(small)]
+    held = table(ROOT / "loop" / "holdout.tsv")  # (loop_main.py HOLDOUT_FILE: every HOLDOUT_EVERY loops)
+    rows += ["", paint("보관용", "1") + paint.dim(" 루프 시작 때")]
+    rows += [paint.dim(f"{fit(r.get('loop', '-'), 3)}") + f"{r.get('holdout', '-')}" + paint.dim(f"  기준 {r.get('dev', '-')}")
+             for r in held[-3:]] or [paint.dim("아직 없음")]
     faults = data["faults"]
     rows += ["", paint("운영 오류", "1") + (paint.ink(f"  {len(faults)}건", BAD) if faults else paint.dim("  없음"))]
     if faults:
